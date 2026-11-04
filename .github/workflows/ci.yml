@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Sans `version`, l'action lit `minimum_zig_version` dans build.zig.zon :
+      # la CI utilise donc toujours la même version de Zig qu'en local.
+      - uses: mlugg/setup-zig@v2
+
+      - name: Formatage
+        run: zig fmt --check build.zig src
+
+      - name: Tests
+        run: zig build test --summary all
