@@ -18,8 +18,20 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
-    _ = gb.GameBoy.init();
-    std.debug.print("ROM : {s} ({d} octets)\n", .{ path, rom.len });
+    // L'en-tête se lit quel que soit le contrôleur : on l'affiche même
+    // pour une cartouche que l'émulateur ne gère pas encore.
+    const header = gb.cartridge.Header.parse(rom) catch |err| {
+        std.debug.print("{s} : en-tête invalide ({s})\n", .{ path, @errorName(err) });
+        std.process.exit(1);
+    };
+    std.debug.print("Titre : {s}\n", .{header.title});
+    std.debug.print("Type  : {s} (0x{X:0>2})\n", .{ header.typeName(), header.cartridge_type });
+
+    const cart = gb.Cartridge.init(rom) catch |err| {
+        std.debug.print("cartouche non prise en charge ({s})\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    _ = gb.Bus.init(cart);
 }
 
 /// Plus grosse cartouche Game Boy Color (MBC5) : 8 Mio.
