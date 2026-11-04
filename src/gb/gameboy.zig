@@ -9,6 +9,9 @@
 
 const std = @import("std");
 
+pub const cartridge = @import("cartridge.zig");
+pub const Cartridge = cartridge.Cartridge;
+
 /// Assemble les composants de la machine. Vide pour l'instant.
 pub const GameBoy = struct {
     pub fn init() GameBoy {
