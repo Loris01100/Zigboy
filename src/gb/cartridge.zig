@@ -92,7 +92,8 @@ pub const RomOnly = struct {
     rom: []const u8,
 
     pub fn read(self: RomOnly, addr: u16) u8 {
-        return if (addr < self.rom.len) self.rom[addr] else 0xFF;
+        // 0xA000..0xBFFF (RAM externe) : absente, lue comme 0xFF.
+        return if (addr < 0x8000 and addr < self.rom.len) self.rom[addr] else 0xFF;
     }
 
     pub fn write(self: *RomOnly, addr: u16, value: u8) void {
