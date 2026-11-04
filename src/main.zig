@@ -12,6 +12,15 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    const path = args[1];
+    const rom = std.Io.Dir.cwd().readFileAlloc(init.io, path, arena, .limited(max_rom_size + 1)) catch |err| {
+        std.debug.print("impossible de lire {s} : {s}\n", .{ path, @errorName(err) });
+        std.process.exit(1);
+    };
+
     _ = gb.GameBoy.init();
-    std.debug.print("ROM : {s}\n", .{args[1]});
+    std.debug.print("ROM : {s} ({d} octets)\n", .{ path, rom.len });
 }
+
+/// Plus grosse cartouche Game Boy Color (MBC5) : 8 Mio.
+const max_rom_size = 8 * 1024 * 1024;
