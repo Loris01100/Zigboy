@@ -39,6 +39,26 @@ pub fn build(b: *std.Build) void {
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
 
+    // Harnais Blargg (tests/blargg.zig), dans `zig build test` lui aussi.
+    // ReleaseSafe : des dizaines de millions d'instructions par ROM.
+    // ROMs dans test-roms/gb-test-roms, sautées si absentes (CI).
+    const blargg_optimize: std.builtin.OptimizeMode = .ReleaseSafe;
+    const blargg_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/blargg.zig"),
+            .target = target,
+            .optimize = blargg_optimize,
+            .imports = &.{.{ .name = "gb", .module = b.createModule(.{
+                .root_source_file = b.path("src/gb/gameboy.zig"),
+                .target = target,
+                .optimize = blargg_optimize,
+            }) }},
+        }),
+    });
+    const blargg_cmd = b.addRunArtifact(blargg_tests);
+    blargg_cmd.setCwd(b.path("."));
+    test_step.dependOn(&blargg_cmd.step);
+
     // zig build sst [-- 27 cb37] : SingleStepTests du CPU.
     // Données à cloner dans test-roms/sm83 (ignoré par git, voir tests/sst.zig).
     // Toujours en ReleaseSafe : 500 000 cas passent vite, et les
