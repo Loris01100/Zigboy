@@ -63,4 +63,25 @@ pub fn build(b: *std.Build) void {
     sst_cmd.addArg("test-roms/sm83/v1");
     sst_cmd.addPassthruArgs();
     sst_step.dependOn(&sst_cmd.step);
+
+    // zig build doctor -- <rom.gb> <journal.log> : journal pour Gameboy Doctor
+    // (voir tests/doctor.zig). ReleaseFast : plusieurs millions de lignes.
+    const doctor = b.addExecutable(.{
+        .name = "doctor",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/doctor.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{.{ .name = "gb", .module = b.createModule(.{
+                .root_source_file = b.path("src/gb/gameboy.zig"),
+                .target = target,
+                .optimize = .ReleaseFast,
+            }) }},
+        }),
+    });
+    const doctor_step = b.step("doctor", "Écrit le journal Gameboy Doctor d'une ROM");
+    const doctor_cmd = b.addRunArtifact(doctor);
+    doctor_cmd.setCwd(b.path("."));
+    doctor_cmd.addPassthruArgs();
+    doctor_step.dependOn(&doctor_cmd.step);
 }

@@ -29,7 +29,25 @@ zig fmt build.zig src tests # formate le code (la CI fait --check)
 git clone --depth 1 https://github.com/SingleStepTests/sm83.git test-roms/sm83
 ```
 
-Le harnais ([tests/sst.zig](tests/sst.zig)) branche le CPU sur une mémoire plate de 64 Kio, comme le demandent ces tests. Il affiche le détail du premier cas faux de chaque opcode.
+Le harnais ([tests/sst.zig](tests/sst.zig)) branche le CPU sur une mémoire plate de 64 Kio, comme le demandent ces tests. Il affiche le détail du premier cas faux de chaque opcode. STOP (`10`) et HALT (`76`) sont ignorés par défaut : les données (issues d'Ares) les modélisent autrement que les Pan Docs. `zig build sst -- 10 76` les lance quand même.
+
+### Gameboy Doctor
+
+[Gameboy Doctor](https://github.com/robert/gameboy-doctor) compare l'état du CPU, instruction par instruction, à celui d'un émulateur de référence sur les ROMs `cpu_instrs` de Blargg. Récupération des outils :
+
+```sh
+git clone --depth 1 https://github.com/robert/gameboy-doctor.git test-roms/gameboy-doctor
+git clone --depth 1 https://github.com/retrio/gb-test-roms.git test-roms/gb-test-roms
+```
+
+Puis, pour la ROM n° 3 par exemple :
+
+```sh
+zig build doctor -- "test-roms/gb-test-roms/cpu_instrs/individual/03-op sp,hl.gb" test-roms/logs/3.log
+python test-roms/gameboy-doctor/gameboy-doctor test-roms/logs/3.log cpu_instrs 3
+```
+
+Le traceur ([tests/doctor.zig](tests/doctor.zig)) fait lire 0x90 à LY (0xFF44) et affiche aussi ce que la ROM écrit sur le port série (`Passed` ou `Failed`). `02-interrupts` ne peut pas passer avant la phase 3.
 
 ## Structure
 

@@ -196,6 +196,42 @@ pub const Cpu = struct {
             return 5;
         }
 
+        // LD (rr),A / LD A,(rr) : p choisit l'adresse BC, DE, HL+ ou HL-,
+        // q le sens (0 : écriture de A, 1 : lecture dans A).
+        // HL+ et HL- : HL est incrémenté / décrémenté après l'accès.
+        if (x == 0 and z == 2) {
+            const addr = switch (p) {
+                0 => self.bc(),
+                1 => self.de(),
+                2, 3 => self.hl(),
+            };
+            if (p == 2) self.setHl(addr +% 1);
+            if (p == 3) self.setHl(addr -% 1);
+            if (q == 0) bus.write(addr, self.a) else self.a = bus.read(addr);
+            return 2;
+        }
+
+        // LDH (n),A / LDH A,(n) : adresse 0xFF00 + n (registres d'E/S, HRAM)
+        if (op == 0xE0 or op == 0xF0) {
+            const addr = 0xFF00 | @as(u16, self.fetch(bus));
+            if (op == 0xE0) bus.write(addr, self.a) else self.a = bus.read(addr);
+            return 3;
+        }
+
+        // LD (C),A / LD A,(C) : comme LDH, avec C à la place de n
+        if (op == 0xE2 or op == 0xF2) {
+            const addr = 0xFF00 | @as(u16, self.c);
+            if (op == 0xE2) bus.write(addr, self.a) else self.a = bus.read(addr);
+            return 2;
+        }
+
+        // LD (nn),A / LD A,(nn)
+        if (op == 0xEA or op == 0xFA) {
+            const addr = self.fetch16(bus);
+            if (op == 0xEA) bus.write(addr, self.a) else self.a = bus.read(addr);
+            return 4;
+        }
+
         // LD SP,HL
         if (op == 0xF9) {
             self.sp = self.hl();
@@ -714,6 +750,63 @@ test "HALT (0x76, pas un LD) : le CPU s'arrête, PC ne bouge plus" {
     try expectEqual(@as(u8, 1), try cpu.step(&bus)); // rien n'est exécuté
     try expectEqual(@as(u16, 0xC001), cpu.pc);
     try expectEqual(@as(u8, 0x00), cpu.b);
+}
+
+test "LD (BC),A / LD A,(DE) : 2 M-cycles" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0x02, 0x1A });
+    cpu.setBc(0xC100);
+    cpu.setDe(0xC200);
+    cpu.a = 0x5A;
+    bus.write(0xC200, 0x77);
+
+    try expectEqual(@as(u8, 2), try cpu.step(&bus));
+    try expectEqual(@as(u8, 0x5A), bus.read(0xC100));
+    try expectEqual(@as(u8, 2), try cpu.step(&bus));
+    try expectEqual(@as(u8, 0x77), cpu.a);
+}
+
+test "LD (HL+),A / LD A,(HL-) : HL bouge après l'accès" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0x22, 0x3A });
+    cpu.setHl(0xC1FF);
+    cpu.a = 0x11;
+
+    try expectEqual(@as(u8, 2), try cpu.step(&bus)); // LD (HL+),A
+    try expectEqual(@as(u8, 0x11), bus.read(0xC1FF));
+    try expectEqual(@as(u16, 0xC200), cpu.hl());
+
+    bus.write(0xC200, 0x22);
+    try expectEqual(@as(u8, 2), try cpu.step(&bus)); // LD A,(HL-)
+    try expectEqual(@as(u8, 0x22), cpu.a);
+    try expectEqual(@as(u16, 0xC1FF), cpu.hl());
+}
+
+test "LDH, LD (C) et LD (nn) : adresses 0xFF00 + n, 0xFF00 + C et nn" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{
+        0xE0, 0x80, // LDH (0x80),A    3 M-cycles
+        0xF2, // LD A,(C)        2 M-cycles
+        0xEA, 0x00, 0xC1, // LD (0xC100),A   4 M-cycles
+        0xF0, 0x81, // LDH A,(0x81)
+        0xFA, 0x00, 0xC1, // LD A,(0xC100)
+    });
+    cpu.a = 0x42;
+    cpu.c = 0x81;
+    bus.write(0xFF81, 0x99);
+
+    try expectEqual(@as(u8, 3), try cpu.step(&bus));
+    try expectEqual(@as(u8, 0x42), bus.read(0xFF80));
+    try expectEqual(@as(u8, 2), try cpu.step(&bus));
+    try expectEqual(@as(u8, 0x99), cpu.a);
+    try expectEqual(@as(u8, 4), try cpu.step(&bus));
+    try expectEqual(@as(u8, 0x99), bus.read(0xC100));
+    cpu.a = 0;
+    try expectEqual(@as(u8, 3), try cpu.step(&bus));
+    try expectEqual(@as(u8, 0x99), cpu.a);
+    cpu.a = 0;
+    try expectEqual(@as(u8, 4), try cpu.step(&bus));
+    try expectEqual(@as(u8, 0x99), cpu.a);
 }
 
 test "LD rr,nn : 3 M-cycles, little-endian" {
