@@ -20,6 +20,11 @@
 //!
 //! Écran éteint (LCDC bit 7 = 0) : LY = 0, mode 0, le PPU ne bouge plus.
 //! Au rallumage, il repart du dot 0 de la ligne 0.
+//!
+//! Le PPU possède aussi la VRAM (tuiles et tilemaps) et l'OAM (attributs
+//! des 40 sprites) : le bus ne fait qu'aiguiller vers elles. Le CPU y a
+//! accès à tout moment, même en modes 2 et 3 : le vrai matériel le
+//! bloque, mais dmg-acid2 n'en a pas besoin.
 
 const std = @import("std");
 
@@ -57,7 +62,15 @@ const stat_irq_oam: u8 = 0x20;
 const stat_irq_lyc: u8 = 0x40;
 const stat_writable: u8 = 0x78;
 
+pub const vram_size = 0x2000;
+pub const oam_size = 0xA0;
+
 pub const Ppu = struct {
+    /// VRAM (0x8000..0x9FFF), indexée depuis 0.
+    vram: [vram_size]u8 = @splat(0),
+    /// OAM (0xFE00..0xFE9F), indexée depuis 0 : 40 sprites × 4 octets.
+    oam: [oam_size]u8 = @splat(0),
+
     /// Position dans la ligne courante, de 0 à 455.
     dot: u16 = 0,
     /// LY (0xFF44) : ligne courante, de 0 à 153. Lecture seule.
@@ -84,6 +97,20 @@ pub const Ppu = struct {
     stat_line: bool = false,
     /// BGP (0xFF47) : palette du fond. 0xFC = 3, 3, 3, 0 (indices 3 à 0).
     bgp: u8 = 0xFC,
+    /// SCY, SCX (0xFF42, 0xFF43) : défilement du fond.
+    scy: u8 = 0,
+    scx: u8 = 0,
+    /// DMA (0xFF46) : dernière valeur écrite. La copie elle-même est
+    /// faite par le bus, le seul à voir toute la mémoire.
+    dma: u8 = 0xFF,
+    /// OBP0, OBP1 (0xFF48, 0xFF49) : palettes des sprites (la couleur 0
+    /// est transparente, ses bits sont ignorés). Le boot ROM ne les
+    /// initialise pas : 0xFF, comme la plupart des émulateurs.
+    obp0: u8 = 0xFF,
+    obp1: u8 = 0xFF,
+    /// WY, WX (0xFF4A, 0xFF4B) : position de la fenêtre (X décalé de 7).
+    wy: u8 = 0,
+    wx: u8 = 0,
 
     /// Fait avancer le PPU de `dots` cycles d'horloge.
     /// Renvoie les interruptions à lever.
@@ -165,9 +192,16 @@ pub const Ppu = struct {
                 const coincidence: u8 = if (self.ly == self.lyc) stat_coincidence else 0;
                 break :blk 0x80 | self.stat | coincidence | @backingInt(self.mode);
             },
+            0xFF42 => self.scy,
+            0xFF43 => self.scx,
             0xFF44 => self.ly,
             0xFF45 => self.lyc,
+            0xFF46 => self.dma,
             0xFF47 => self.bgp,
+            0xFF48 => self.obp0,
+            0xFF49 => self.obp1,
+            0xFF4A => self.wy,
+            0xFF4B => self.wx,
             else => unreachable,
         };
     }
@@ -192,10 +226,17 @@ pub const Ppu = struct {
             },
             // Seuls les bits 3 à 6 (sources de l'interruption STAT) s'écrivent.
             0xFF41 => self.stat = value & stat_writable,
+            0xFF42 => self.scy = value,
+            0xFF43 => self.scx = value,
             // LY est en lecture seule.
             0xFF44 => {},
             0xFF45 => self.lyc = value,
+            0xFF46 => self.dma = value,
             0xFF47 => self.bgp = value,
+            0xFF48 => self.obp0 = value,
+            0xFF49 => self.obp1 = value,
+            0xFF4A => self.wy = value,
+            0xFF4B => self.wx = value,
             else => unreachable,
         }
         self.updateStatLine(&irq);
@@ -213,6 +254,16 @@ test "valeurs après le boot ROM : LCDC = 0x91, STAT = 0x85, BGP = 0xFC" {
     try expectEqual(@as(u8, 0x85), ppu.read(0xFF41));
     try expectEqual(@as(u8, 0xFC), ppu.read(0xFF47));
     try expectEqual(@as(u8, 0), ppu.read(0xFF44));
+}
+
+test "SCY, SCX, DMA, palettes, WY, WX : relus tels qu'écrits" {
+    var ppu: Ppu = .{};
+    const addrs = [_]u16{ 0xFF42, 0xFF43, 0xFF46, 0xFF47, 0xFF48, 0xFF49, 0xFF4A, 0xFF4B };
+    for (addrs, 0..) |addr, i| {
+        const value: u8 = @intCast(0x11 * (i + 1));
+        try expectEqual(false, ppu.write(addr, value).stat);
+        try expectEqual(value, ppu.read(addr));
+    }
 }
 
 test "une ligne : mode 2 pendant 80 dots, 3 pendant 172, puis 0" {

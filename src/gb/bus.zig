@@ -35,9 +35,7 @@ pub const Interrupt = enum(u3) {
 
 pub const Bus = struct {
     cart: Cartridge,
-    vram: [0x2000]u8 = @splat(0),
     wram: [0x2000]u8 = @splat(0),
-    oam: [0xA0]u8 = @splat(0),
     hram: [0x7F]u8 = @splat(0),
     ie: u8 = 0,
     /// IF (0xFF0F) : interruptions demandées, une par bit (voir `Interrupt`).
@@ -51,7 +49,7 @@ pub const Bus = struct {
     serial: SerialOutput = .{},
     /// DIV, TIMA, TMA, TAC (0xFF04..0xFF07).
     timer: Timer = .{},
-    /// PPU : LCDC, STAT, LY, LYC, BGP (0xFF40, 0xFF41, 0xFF44, 0xFF45, 0xFF47).
+    /// PPU : VRAM, OAM et registres 0xFF40..0xFF4B.
     ppu: Ppu = .{},
     /// Imite l'émulateur qui a produit les journaux de Gameboy Doctor
     /// (tests/doctor.zig), au prix de deux écarts avec le vrai matériel :
@@ -69,11 +67,11 @@ pub const Bus = struct {
     pub fn read(self: *Bus, addr: u16) u8 {
         return switch (addr) {
             0x0000...0x7FFF => self.cart.read(addr),
-            0x8000...0x9FFF => self.vram[addr - 0x8000],
+            0x8000...0x9FFF => self.ppu.vram[addr - 0x8000],
             0xA000...0xBFFF => self.cart.read(addr),
             0xC000...0xDFFF => self.wram[addr - 0xC000],
             0xE000...0xFDFF => self.wram[addr - 0xE000],
-            0xFE00...0xFE9F => self.oam[addr - 0xFE00],
+            0xFE00...0xFE9F => self.ppu.oam[addr - 0xFE00],
             0xFEA0...0xFEFF => 0xFF,
             0xFF00...0xFF7F => self.readIo(addr),
             0xFF80...0xFFFE => self.hram[addr - 0xFF80],
@@ -86,11 +84,11 @@ pub const Bus = struct {
             // Sur ROM : la cartouche décide (ignoré en ROM ONLY,
             // registres de banque pour les MBC).
             0x0000...0x7FFF => self.cart.write(addr, value),
-            0x8000...0x9FFF => self.vram[addr - 0x8000] = value,
+            0x8000...0x9FFF => self.ppu.vram[addr - 0x8000] = value,
             0xA000...0xBFFF => self.cart.write(addr, value),
             0xC000...0xDFFF => self.wram[addr - 0xC000] = value,
             0xE000...0xFDFF => self.wram[addr - 0xE000] = value,
-            0xFE00...0xFE9F => self.oam[addr - 0xFE00] = value,
+            0xFE00...0xFE9F => self.ppu.oam[addr - 0xFE00] = value,
             0xFEA0...0xFEFF => {},
             0xFF00...0xFF7F => self.writeIo(addr, value),
             0xFF80...0xFFFE => self.hram[addr - 0xFF80] = value,
@@ -125,8 +123,8 @@ pub const Bus = struct {
             0xFF04...0xFF07 => self.timer.read(addr),
             // Les bits 5 à 7 de IF n'existent pas et se lisent à 1.
             0xFF0F => if (self.doctor_mode) self.if_ else self.if_ | 0xE0,
-            0xFF40, 0xFF41, 0xFF45, 0xFF47 => self.ppu.read(addr),
             0xFF44 => if (self.doctor_mode) 0x90 else self.ppu.read(addr),
+            0xFF40...0xFF43, 0xFF45...0xFF4B => self.ppu.read(addr),
             else => self.unimplementedRead(),
         };
     }
@@ -151,8 +149,22 @@ pub const Bus = struct {
             },
             0xFF04...0xFF07 => if (self.timer.write(addr, value)) self.requestInterrupt(.timer),
             0xFF0F => self.if_ = value & 0x1F,
-            0xFF40, 0xFF41, 0xFF44, 0xFF45, 0xFF47 => self.requestPpuInterrupts(self.ppu.write(addr, value)),
+            0xFF46 => self.oamDma(value),
+            0xFF40...0xFF45, 0xFF47...0xFF4B => self.requestPpuInterrupts(self.ppu.write(addr, value)),
             else => self.unimplemented_io_accesses += 1,
+        }
+    }
+
+    /// DMA OAM : copie les 160 octets situés à partir de `value << 8`
+    /// vers l'OAM. Instantané ici ; le vrai matériel y passe 160 M-cycles.
+    fn oamDma(self: *Bus, value: u8) void {
+        _ = self.ppu.write(0xFF46, value);
+        // Au-delà de 0xDF, le DMA tombe sur la WRAM (comme l'echo RAM),
+        // jamais sur l'OAM ni les E/S.
+        const page: u16 = if (value >= 0xE0) value - 0x20 else value;
+        const src = page << 8;
+        for (&self.ppu.oam, 0..) |*byte, i| {
+            byte.* = self.read(src + @as(u16, @intCast(i)));
         }
     }
 };
@@ -283,6 +295,78 @@ test "timer : débordement de TIMA via le bus -> IF bit 2" {
     bus.tick(1);
     try std.testing.expectEqual(Interrupt.timer.mask(), bus.if_);
     try std.testing.expectEqual(@as(u8, 0x10), bus.read(0xFF05));
+    try std.testing.expectEqual(@as(u64, 0), bus.unimplemented_io_accesses);
+}
+
+test "VRAM et OAM : le bus aiguille vers le PPU" {
+    var buf: [32 * 1024]u8 = undefined;
+    var bus = try testBus(&buf);
+
+    bus.write(0x8000, 0x12);
+    bus.write(0x9FFF, 0x34);
+    bus.write(0xFE00, 0x56);
+    bus.write(0xFE9F, 0x78);
+    try std.testing.expectEqual(@as(u8, 0x12), bus.ppu.vram[0]);
+    try std.testing.expectEqual(@as(u8, 0x34), bus.ppu.vram[0x1FFF]);
+    try std.testing.expectEqual(@as(u8, 0x56), bus.ppu.oam[0]);
+    try std.testing.expectEqual(@as(u8, 0x78), bus.ppu.oam[0x9F]);
+    try std.testing.expectEqual(@as(u8, 0x34), bus.read(0x9FFF));
+    try std.testing.expectEqual(@as(u8, 0x78), bus.read(0xFE9F));
+}
+
+test "VRAM et OAM restent accessibles en mode 3" {
+    var buf: [32 * 1024]u8 = undefined;
+    var bus = try testBus(&buf);
+
+    bus.tick(25); // dot 100 de la ligne 0
+    try std.testing.expectEqual(ppu_mod.Mode.drawing, bus.ppu.mode);
+    bus.write(0x8010, 0xAB);
+    bus.write(0xFE10, 0xCD);
+    try std.testing.expectEqual(@as(u8, 0xAB), bus.read(0x8010));
+    try std.testing.expectEqual(@as(u8, 0xCD), bus.read(0xFE10));
+}
+
+test "DMA OAM : 0xC1 en 0xFF46 copie 0xC100..0xC19F vers l'OAM" {
+    var buf: [32 * 1024]u8 = undefined;
+    var bus = try testBus(&buf);
+
+    for (0..0xA0) |i| bus.write(0xC100 + @as(u16, @intCast(i)), @intCast(i ^ 0x5A));
+    bus.write(0xC1A0, 0xEE); // juste après : pas copié
+    bus.write(0xFF46, 0xC1);
+    for (0..0xA0) |i| {
+        try std.testing.expectEqual(@as(u8, @intCast(i ^ 0x5A)), bus.ppu.oam[i]);
+    }
+    try std.testing.expectEqual(@as(u8, 0xC1), bus.read(0xFF46));
+    try std.testing.expectEqual(@as(u64, 0), bus.unimplemented_io_accesses);
+}
+
+test "DMA OAM : depuis la ROM, et au-delà de 0xDF depuis la WRAM" {
+    var buf: [32 * 1024]u8 = undefined;
+    @memset(&buf, 0);
+    buf[0x4000] = 0x99;
+    buf[0x409F] = 0x77;
+    buf[0x014D] = cartridge.computeChecksum(&buf);
+    var bus = Bus.init(try Cartridge.init(&buf));
+
+    bus.write(0xFF46, 0x40);
+    try std.testing.expectEqual(@as(u8, 0x99), bus.ppu.oam[0]);
+    try std.testing.expectEqual(@as(u8, 0x77), bus.ppu.oam[0x9F]);
+
+    bus.write(0xDF00, 0x42);
+    bus.write(0xFF46, 0xFF);
+    try std.testing.expectEqual(@as(u8, 0x42), bus.ppu.oam[0]);
+}
+
+test "registres PPU 0xFF42..0xFF4B via le bus" {
+    var buf: [32 * 1024]u8 = undefined;
+    var bus = try testBus(&buf);
+
+    const addrs = [_]u16{ 0xFF42, 0xFF43, 0xFF45, 0xFF47, 0xFF48, 0xFF49, 0xFF4A, 0xFF4B };
+    for (addrs, 0..) |addr, i| {
+        const value: u8 = @intCast(0x10 + i);
+        bus.write(addr, value);
+        try std.testing.expectEqual(value, bus.read(addr));
+    }
     try std.testing.expectEqual(@as(u64, 0), bus.unimplemented_io_accesses);
 }
 
