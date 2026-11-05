@@ -7,10 +7,12 @@
 //!
 //! Les ROMs vivent dans test-roms/gb-test-roms (ignoré par git, cloner
 //! https://github.com/retrio/gb-test-roms). Si une ROM manque, son test
-//! est sauté plutôt que de faire échouer `zig build test`.
+//! est sauté plutôt que de faire échouer `zig build test`, sauf avec
+//! `-Drequire-test-roms` (CI) : là, une ROM manquante est une erreur.
 
 const std = @import("std");
 const gb = @import("gb");
+const build_options = @import("build_options");
 
 const rom_dir = "test-roms/gb-test-roms/";
 
@@ -25,7 +27,13 @@ fn runBlargg(path: []const u8) !void {
     const allocator = std.testing.allocator;
 
     const rom = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(8 * 1024 * 1024)) catch |err| switch (err) {
-        error.FileNotFound => return error.SkipZigTest,
+        error.FileNotFound => {
+            if (build_options.require_test_roms) {
+                std.debug.print("ROM introuvable : {s}\n", .{path});
+                return err;
+            }
+            return error.SkipZigTest;
+        },
         else => return err,
     };
     defer allocator.free(rom);

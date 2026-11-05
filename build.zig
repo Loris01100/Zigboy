@@ -41,22 +41,32 @@ pub fn build(b: *std.Build) void {
 
     // Harnais Blargg (tests/blargg.zig), dans `zig build test` lui aussi.
     // ReleaseSafe : des dizaines de millions d'instructions par ROM.
-    // ROMs dans test-roms/gb-test-roms, sautées si absentes (CI).
+    // ROMs dans test-roms/gb-test-roms, sautées si absentes, sauf avec
+    // -Drequire-test-roms (utilisé en CI) : une ROM manquante fait alors échouer.
+    const require_test_roms = b.option(bool, "require-test-roms", "Échoue si une ROM de test manque") orelse false;
+    const blargg_options = b.addOptions();
+    blargg_options.addOption(bool, "require_test_roms", require_test_roms);
     const blargg_optimize: std.builtin.OptimizeMode = .ReleaseSafe;
     const blargg_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/blargg.zig"),
             .target = target,
             .optimize = blargg_optimize,
-            .imports = &.{.{ .name = "gb", .module = b.createModule(.{
-                .root_source_file = b.path("src/gb/gameboy.zig"),
-                .target = target,
-                .optimize = blargg_optimize,
-            }) }},
+            .imports = &.{
+                .{ .name = "gb", .module = b.createModule(.{
+                    .root_source_file = b.path("src/gb/gameboy.zig"),
+                    .target = target,
+                    .optimize = blargg_optimize,
+                }) },
+                .{ .name = "build_options", .module = blargg_options.createModule() },
+            },
         }),
     });
     const blargg_cmd = b.addRunArtifact(blargg_tests);
     blargg_cmd.setCwd(b.path("."));
+    // Les ROMs sont lues à l'exécution, hors du suivi du cache de Zig :
+    // sans ça, un résultat en cache masquerait une ROM ajoutée ou retirée.
+    blargg_cmd.has_side_effects = true;
     test_step.dependOn(&blargg_cmd.step);
 
     // zig build sst [-- 27 cb37] : SingleStepTests du CPU.

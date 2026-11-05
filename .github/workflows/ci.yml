@@ -21,5 +21,9 @@ jobs:
       - name: Formatage
         run: zig fmt --check build.zig src tests
 
+      # Les ROMs de Blargg ne sont pas versionnées (test-roms/ est ignoré).
+      - name: ROMs de test
+        run: git clone --depth 1 https://github.com/retrio/gb-test-roms test-roms/gb-test-roms
+
       - name: Tests
-        run: zig build test --summary all
+        run: zig build test -Drequire-test-roms --summary all
