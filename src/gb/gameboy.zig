@@ -18,9 +18,11 @@ pub const cpu = @import("cpu.zig");
 pub const Cpu = cpu.Cpu;
 pub const timer = @import("timer.zig");
 pub const Timer = timer.Timer;
+pub const ppu = @import("ppu.zig");
+pub const Ppu = ppu.Ppu;
 
 /// La machine complète : le CPU et le bus, qui porte la mémoire et les
-/// périphériques (timer sur 0xFF04..0xFF07, port série, IF/IE...).
+/// périphériques (timer sur 0xFF04..0xFF07, PPU, port série, IF/IE...).
 ///
 /// Le bus pèse plusieurs dizaines de Kio : allouer le `GameBoy` sur le
 /// tas (ou en global) plutôt que sur une petite pile.

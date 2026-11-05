@@ -15,6 +15,7 @@ const std = @import("std");
 const cartridge = @import("cartridge.zig");
 const Cartridge = cartridge.Cartridge;
 const Timer = @import("timer.zig").Timer;
+const Ppu = @import("ppu.zig").Ppu;
 
 /// Les 5 sources d'interruption, numérotées par leur bit dans IE et IF.
 /// Le numéro donne aussi la priorité (0 = la plus prioritaire)
@@ -49,6 +50,8 @@ pub const Bus = struct {
     serial: SerialOutput = .{},
     /// DIV, TIMA, TMA, TAC (0xFF04..0xFF07).
     timer: Timer = .{},
+    /// PPU : LCDC, STAT, LY, BGP (0xFF40, 0xFF41, 0xFF44, 0xFF47).
+    ppu: Ppu = .{},
     /// Imite l'émulateur qui a produit les journaux de Gameboy Doctor
     /// (tests/doctor.zig), au prix de deux écarts avec le vrai matériel :
     /// LY (0xFF44) vaut toujours 0x90, et IF (0xFF0F) se lit sans
@@ -94,10 +97,13 @@ pub const Bus = struct {
         }
     }
 
-    /// Fait avancer les composants (pour l'instant le timer) de `m_cycles`
-    /// M-cycles. À appeler après chaque `Cpu.step`.
+    /// Fait avancer les composants (timer, PPU) de `m_cycles` M-cycles.
+    /// À appeler après chaque `Cpu.step`.
     pub fn tick(self: *Bus, m_cycles: u8) void {
         if (self.timer.tick(m_cycles)) self.requestInterrupt(.timer);
+        // 4 dots (cycles d'horloge) par M-cycle.
+        const ppu_irq = self.ppu.tick(@as(u16, m_cycles) * 4);
+        if (ppu_irq.vblank) self.requestInterrupt(.vblank);
     }
 
     /// Lève le drapeau d'une interruption dans IF. Appelée par le timer,
@@ -114,7 +120,8 @@ pub const Bus = struct {
             0xFF04...0xFF07 => self.timer.read(addr),
             // Les bits 5 à 7 de IF n'existent pas et se lisent à 1.
             0xFF0F => if (self.doctor_mode) self.if_ else self.if_ | 0xE0,
-            0xFF44 => if (self.doctor_mode) 0x90 else self.unimplementedRead(),
+            0xFF40, 0xFF41, 0xFF47 => self.ppu.read(addr),
+            0xFF44 => if (self.doctor_mode) 0x90 else self.ppu.read(addr),
             else => self.unimplementedRead(),
         };
     }
@@ -139,6 +146,7 @@ pub const Bus = struct {
             },
             0xFF04...0xFF07 => if (self.timer.write(addr, value)) self.requestInterrupt(.timer),
             0xFF0F => self.if_ = value & 0x1F,
+            0xFF40, 0xFF41, 0xFF44, 0xFF47 => self.ppu.write(addr, value),
             else => self.unimplemented_io_accesses += 1,
         }
     }
@@ -203,8 +211,8 @@ test "E/S non implémentées : 0xFF, écriture ignorée, accès comptés" {
     var buf: [32 * 1024]u8 = undefined;
     var bus = try testBus(&buf);
 
-    bus.write(0xFF40, 0x91);
-    try std.testing.expectEqual(@as(u8, 0xFF), bus.read(0xFF40));
+    bus.write(0xFF4D, 0x91);
+    try std.testing.expectEqual(@as(u8, 0xFF), bus.read(0xFF4D));
     try std.testing.expectEqual(@as(u64, 2), bus.unimplemented_io_accesses);
 }
 
@@ -277,9 +285,24 @@ test "doctor_mode : LY = 0x90 et IF sans ses bits inutilisés" {
     var buf: [32 * 1024]u8 = undefined;
     var bus = try testBus(&buf);
 
-    try std.testing.expectEqual(@as(u8, 0xFF), bus.read(0xFF44));
+    try std.testing.expectEqual(@as(u8, 0), bus.read(0xFF44));
     bus.doctor_mode = true;
     try std.testing.expectEqual(@as(u8, 0x90), bus.read(0xFF44));
     bus.requestInterrupt(.timer);
     try std.testing.expectEqual(@as(u8, 0x04), bus.read(0xFF0F));
+}
+
+test "PPU : 144 lignes de M-cycles via le bus -> IF bit 0, LY = 144" {
+    var buf: [32 * 1024]u8 = undefined;
+    var bus = try testBus(&buf);
+
+    // 144 × 456 dots = 16 416 M-cycles.
+    for (0..16_415) |_| bus.tick(1);
+    try std.testing.expectEqual(@as(u8, 0), bus.if_);
+    try std.testing.expectEqual(@as(u8, 143), bus.read(0xFF44));
+    bus.tick(1);
+    try std.testing.expectEqual(Interrupt.vblank.mask(), bus.if_);
+    try std.testing.expectEqual(@as(u8, 144), bus.read(0xFF44));
+    try std.testing.expectEqual(@as(u8, 0x81), bus.read(0xFF41) & 0x83);
+    try std.testing.expectEqual(@as(u64, 0), bus.unimplemented_io_accesses);
 }
