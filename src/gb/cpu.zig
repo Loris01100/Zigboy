@@ -222,7 +222,51 @@ pub const Cpu = struct {
             return if (y == 6) 3 else 1;
         }
 
+        // ADD HL,rr : Z inchangé, H sur le bit 11, C sur le bit 15
+        if (x == 0 and z == 1 and q == 1) {
+            const v = self.readRp(p);
+            const h = self.hl();
+            self.f.n = false;
+            self.f.h = (h & 0x0FFF) + (v & 0x0FFF) > 0x0FFF;
+            self.f.c = @as(u32, h) + v > 0xFFFF;
+            self.setHl(h +% v);
+            return 2;
+        }
+
+        // INC rr / DEC rr : aucun flag touché
+        if (x == 0 and z == 3) {
+            const v = self.readRp(p);
+            self.writeRp(p, if (q == 0) v +% 1 else v -% 1);
+            return 2;
+        }
+
+        // ADD SP,e
+        if (op == 0xE8) {
+            self.sp = self.spPlusE(self.fetch(bus));
+            return 4;
+        }
+
+        // LD HL,SP+e
+        if (op == 0xF8) {
+            self.setHl(self.spPlusE(self.fetch(bus)));
+            return 3;
+        }
+
         return error.UnimplementedOpcode;
+    }
+
+    /// SP + e (e signé) pour ADD SP,e et LD HL,SP+e.
+    /// Z = N = 0 ; H et C viennent de l'addition non signée de l'octet bas
+    /// de SP avec e, comme si e était un u8.
+    fn spPlusE(self: *Cpu, e: u8) u16 {
+        const sp = self.sp;
+        const lo: u8 = @truncate(sp);
+        self.f = .{
+            .h = (lo & 0x0F) + (e & 0x0F) > 0x0F,
+            .c = @as(u16, lo) + e > 0xFF,
+        };
+        const offset: i16 = @as(i8, @bitCast(e));
+        return sp +% @as(u16, @bitCast(offset));
     }
 
     /// Opérations ALU 8 bits sur A, dans l'ordre de y :
@@ -268,6 +312,15 @@ pub const Cpu = struct {
                 self.f = .{ .z = self.a == 0 };
             },
         }
+    }
+
+    fn readRp(self: *const Cpu, comptime i: u2) u16 {
+        return switch (i) {
+            0 => self.bc(),
+            1 => self.de(),
+            2 => self.hl(),
+            3 => self.sp,
+        };
     }
 
     fn writeRp(self: *Cpu, comptime i: u2, value: u16) void {
@@ -602,4 +655,87 @@ test "INC (HL) / DEC (HL) : 3 M-cycles" {
     bus.write(0xC100, 0x01);
     _ = try cpu.step(&bus);
     try expectEqual(true, cpu.f.z);
+}
+
+test "ADD HL,rr : 2 M-cycles, Z inchangé, H au bit 11, C au bit 15" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0x09, 0x19, 0x29, 0x39 });
+    cpu.f = .{ .z = true, .n = true };
+
+    cpu.setHl(0x0FFF);
+    cpu.setBc(0x0001);
+    try expectEqual(@as(u8, 2), try cpu.step(&bus)); // ADD HL,BC
+    try expectEqual(@as(u16, 0x1000), cpu.hl());
+    try expectEqual(@as(u8, 0xA0), @as(u8, @bitCast(cpu.f))); // Z (inchangé) H
+
+    cpu.setHl(0x8000);
+    cpu.setDe(0x8000);
+    _ = try cpu.step(&bus); // ADD HL,DE
+    try expectEqual(@as(u16, 0x0000), cpu.hl());
+    try expectEqual(@as(u8, 0x90), @as(u8, @bitCast(cpu.f))); // Z (inchangé) C, pas de Z recalculé
+
+    cpu.f = .{};
+    cpu.setHl(0x1234);
+    _ = try cpu.step(&bus); // ADD HL,HL
+    try expectEqual(@as(u16, 0x2468), cpu.hl());
+    try expectEqual(@as(u8, 0x00), @as(u8, @bitCast(cpu.f)));
+
+    cpu.sp = 0xF000;
+    _ = try cpu.step(&bus); // ADD HL,SP
+    try expectEqual(@as(u16, 0x1468), cpu.hl());
+    try expectEqual(@as(u8, 0x10), @as(u8, @bitCast(cpu.f))); // C
+}
+
+test "INC rr / DEC rr : 2 M-cycles, débordement, flags intacts" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0x03, 0x1B, 0x23, 0x3B });
+    cpu.f = .{ .z = true, .c = true };
+    const f = cpu.f;
+
+    cpu.setBc(0xFFFF);
+    try expectEqual(@as(u8, 2), try cpu.step(&bus)); // INC BC
+    try expectEqual(@as(u16, 0x0000), cpu.bc());
+    cpu.setDe(0x0000);
+    try expectEqual(@as(u8, 2), try cpu.step(&bus)); // DEC DE
+    try expectEqual(@as(u16, 0xFFFF), cpu.de());
+    cpu.setHl(0x00FF);
+    _ = try cpu.step(&bus); // INC HL
+    try expectEqual(@as(u16, 0x0100), cpu.hl());
+    cpu.sp = 0xD000;
+    _ = try cpu.step(&bus); // DEC SP
+    try expectEqual(@as(u16, 0xCFFF), cpu.sp);
+    try expectEqual(f, cpu.f);
+}
+
+test "ADD SP,e : 4 M-cycles, e signé, H et C sur l'octet bas" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0xE8, 0x01, 0xE8, 0xFF, 0xE8, 0x80 });
+    cpu.f = .{ .z = true, .n = true };
+
+    cpu.sp = 0xD00F;
+    try expectEqual(@as(u8, 4), try cpu.step(&bus)); // +1
+    try expectEqual(@as(u16, 0xD010), cpu.sp);
+    try expectEqual(@as(u8, 0x20), @as(u8, @bitCast(cpu.f))); // H, Z et N à 0
+
+    // -1 : 0x10 + 0xFF en non signé → C, pas de H
+    _ = try cpu.step(&bus);
+    try expectEqual(@as(u16, 0xD00F), cpu.sp);
+    try expectEqual(@as(u8, 0x10), @as(u8, @bitCast(cpu.f)));
+
+    // -128 : 0x0F + 0x80 → ni H ni C
+    _ = try cpu.step(&bus);
+    try expectEqual(@as(u16, 0xCF8F), cpu.sp);
+    try expectEqual(@as(u8, 0x00), @as(u8, @bitCast(cpu.f)));
+}
+
+test "LD HL,SP+e : 3 M-cycles, SP inchangé" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0xF8, 0xFE });
+    cpu.sp = 0xFFFF;
+    cpu.f = .{ .z = true };
+
+    try expectEqual(@as(u8, 3), try cpu.step(&bus)); // SP - 2
+    try expectEqual(@as(u16, 0xFFFD), cpu.hl());
+    try expectEqual(@as(u16, 0xFFFF), cpu.sp);
+    try expectEqual(@as(u8, 0x30), @as(u8, @bitCast(cpu.f))); // 0xFF + 0xFE : H C
 }
