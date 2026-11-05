@@ -113,10 +113,18 @@ pub const Cpu = struct {
         self.l = @truncate(value);
     }
 
-    /// Exécute une instruction et renvoie son nombre de M-cycles.
+    /// Exécute une instruction (ou prend en charge une interruption) et
+    /// renvoie son nombre de M-cycles.
     /// En HALT ou STOP, le CPU est à l'arrêt : 1 M-cycle sans rien lire.
     pub fn step(self: *Cpu, bus: anytype) Error!u8 {
         if (self.halted or self.stopped) return 1;
+        // Les interruptions sont testées AVANT d'appliquer le délai de EI :
+        // juste après EI, IME vaut encore 0 ici, donc l'instruction qui suit
+        // EI s'exécute toujours avant qu'une interruption puisse être prise.
+        if (self.ime) {
+            const pending = bus.read(0xFFFF) & bus.read(0xFF0F) & 0x1F;
+            if (pending != 0) return self.serviceInterrupt(bus, pending);
+        }
         // Délai de EI : l'instruction qui suit EI s'exécute encore avec
         // l'ancien IME ; les interruptions ne seront vues qu'après elle.
         if (self.ime_pending) {
@@ -127,6 +135,22 @@ pub const Cpu = struct {
         return switch (opcode) {
             inline else => |op| self.execute(bus, op),
         };
+    }
+
+    /// Prise en charge d'une interruption : la plus prioritaire est celle
+    /// du bit le plus bas (VBlank > STAT > Timer > Série > Joypad).
+    /// IME passe à 0, son bit est effacé de IF, PC est empilé puis on saute
+    /// au vecteur 0x40 + 8 × bit. Coûte 5 M-cycles.
+    fn serviceInterrupt(self: *Cpu, bus: anytype, pending: u8) u8 {
+        const bit: u3 = @intCast(@ctz(pending));
+        self.ime = false;
+        // Un EI juste avant ne doit pas réactiver IME au milieu du handler.
+        self.ime_pending = false;
+        const flags = bus.read(0xFF0F) & 0x1F;
+        bus.write(0xFF0F, flags & ~(@as(u8, 1) << bit));
+        self.push(bus, self.pc);
+        self.pc = 0x40 + 8 * @as(u16, bit);
+        return 5;
     }
 
     fn fetch(self: *Cpu, bus: anytype) u8 {
@@ -1412,4 +1436,89 @@ test "STOP : 2 octets, le CPU s'arrête" {
     try expectEqual(@as(u16, 0xC002), cpu.pc);
     _ = try cpu.step(&bus);
     try expectEqual(@as(u16, 0xC002), cpu.pc);
+}
+
+test "interruption : IME = 0, bit effacé de IF, PC empilé, saut au vecteur" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{0x00});
+    cpu.ime = true;
+    cpu.sp = 0xDFFE;
+    bus.ie = 0x1F;
+    bus.requestInterrupt(.timer);
+    bus.requestInterrupt(.joypad);
+
+    try expectEqual(@as(u8, 5), try cpu.step(&bus));
+    try expectEqual(false, cpu.ime);
+    try expectEqual(@as(u16, 0x0050), cpu.pc); // 0x40 + 8 × 2
+    try expectEqual(@as(u16, 0xDFFC), cpu.sp);
+    try expectEqual(@as(u8, 0xC0), bus.read(0xDFFD)); // octet haut de 0xC000
+    try expectEqual(@as(u8, 0x00), bus.read(0xDFFC)); // octet bas
+    try expectEqual(@as(u8, 0x10), bus.if_); // seul le joypad reste demandé
+}
+
+test "interruption : priorité au bit le plus bas, IE filtre" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{0x00});
+    cpu.sp = 0xDFFE;
+    bus.if_ = 0x1F;
+
+    // Tout est demandé : VBlank (bit 0) passe en premier.
+    cpu.ime = true;
+    bus.ie = 0x1F;
+    _ = try cpu.step(&bus);
+    try expectEqual(@as(u16, 0x0040), cpu.pc);
+    try expectEqual(@as(u8, 0x1E), bus.if_);
+
+    // VBlank et STAT masqués par IE : c'est le timer.
+    cpu.ime = true;
+    bus.if_ = 0x1F;
+    bus.ie = 0x1C;
+    _ = try cpu.step(&bus);
+    try expectEqual(@as(u16, 0x0050), cpu.pc);
+    try expectEqual(@as(u8, 0x1B), bus.if_);
+
+    // Restent série et joypad : la série (0x58) avant le joypad (0x60).
+    cpu.ime = true;
+    bus.if_ = 0x18;
+    _ = try cpu.step(&bus);
+    try expectEqual(@as(u16, 0x0058), cpu.pc);
+    cpu.ime = true;
+    _ = try cpu.step(&bus);
+    try expectEqual(@as(u16, 0x0060), cpu.pc);
+    try expectEqual(@as(u8, 0x00), bus.if_);
+}
+
+test "interruption : rien si IME = 0 ou si IE & IF = 0" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0x00, 0x00 });
+    bus.ie = 0x01;
+    bus.if_ = 0x01;
+
+    try expectEqual(@as(u8, 1), try cpu.step(&bus)); // IME = 0 : NOP normal
+    try expectEqual(@as(u16, 0xC001), cpu.pc);
+    try expectEqual(@as(u8, 0x01), bus.if_);
+
+    cpu.ime = true;
+    bus.ie = 0x02; // seul STAT autorisé, mais seul VBlank demandé
+    try expectEqual(@as(u8, 1), try cpu.step(&bus));
+    try expectEqual(@as(u16, 0xC002), cpu.pc);
+}
+
+test "interruption : l'instruction qui suit EI s'exécute d'abord" {
+    var buf: [32 * 1024]u8 = undefined;
+    // EI ; INC A ; INC A
+    var cpu, var bus = try setup(&buf, &.{ 0xFB, 0x3C, 0x3C });
+    cpu.a = 0;
+    cpu.sp = 0xDFFE;
+    bus.ie = 0x01;
+    bus.if_ = 0x01;
+
+    _ = try cpu.step(&bus); // EI
+    try expectEqual(@as(u8, 1), try cpu.step(&bus)); // INC A, pas l'interruption
+    try expectEqual(@as(u8, 1), cpu.a);
+    try expectEqual(@as(u8, 5), try cpu.step(&bus)); // maintenant seulement
+    try expectEqual(@as(u16, 0x0040), cpu.pc);
+    try expectEqual(@as(u8, 1), cpu.a); // le 2e INC A n'a pas été exécuté
+    try expectEqual(@as(u8, 0x02), bus.read(0xDFFC)); // retour vers 0xC002
+    try expectEqual(@as(u8, 0xC0), bus.read(0xDFFD));
 }
