@@ -42,6 +42,13 @@ pub const Cpu = struct {
     pc: u16,
     /// Interrupt Master Enable : autorise les interruptions (RETI, EI, DI).
     ime: bool,
+    /// Posé par EI : IME passe à 1 au début de l'instruction suivante,
+    /// donc après qu'elle s'est exécutée côté interruptions.
+    ime_pending: bool,
+    /// HALT : le CPU ne fait plus rien jusqu'à une interruption (phase 3).
+    halted: bool,
+    /// STOP : mode basse consommation jusqu'à un appui sur un bouton (phase 5).
+    stopped: bool,
 
     /// État post-boot d'une DMG (on saute la ROM de boot).
     pub fn init() Cpu {
@@ -57,6 +64,9 @@ pub const Cpu = struct {
             .sp = 0xFFFE,
             .pc = 0x0100,
             .ime = false,
+            .ime_pending = false,
+            .halted = false,
+            .stopped = false,
         };
     }
 
@@ -100,7 +110,15 @@ pub const Cpu = struct {
     }
 
     /// Exécute une instruction et renvoie son nombre de M-cycles.
+    /// En HALT ou STOP, le CPU est à l'arrêt : 1 M-cycle sans rien lire.
     pub fn step(self: *Cpu, bus: *Bus) Error!u8 {
+        if (self.halted or self.stopped) return 1;
+        // Délai de EI : l'instruction qui suit EI s'exécute encore avec
+        // l'ancien IME ; les interruptions ne seront vues qu'après elle.
+        if (self.ime_pending) {
+            self.ime_pending = false;
+            self.ime = true;
+        }
         const opcode = self.fetch(bus);
         return switch (opcode) {
             inline else => |op| self.execute(bus, op),
@@ -339,6 +357,69 @@ pub const Cpu = struct {
         if (x == 0 and z == 7 and y < 4) {
             self.a = self.rot(@truncate(y), self.a);
             self.f.z = false;
+            return 1;
+        }
+
+        // DAA : corrige A après une addition ou soustraction BCD
+        // (chaque quartet code un chiffre décimal 0-9). Algorithme des Pan Docs.
+        if (op == 0x27) {
+            var adj: u8 = 0;
+            var c = self.f.c;
+            if (self.f.n) {
+                if (self.f.h) adj |= 0x06;
+                if (c) adj |= 0x60;
+                self.a -%= adj;
+            } else {
+                if (self.f.h or self.a & 0x0F > 0x09) adj |= 0x06;
+                if (c or self.a > 0x99) {
+                    adj |= 0x60;
+                    c = true;
+                }
+                self.a +%= adj;
+            }
+            self.f = .{ .z = self.a == 0, .n = self.f.n, .c = c };
+            return 1;
+        }
+
+        // CPL : A = ~A ; N = H = 1, Z et C inchangés
+        if (op == 0x2F) {
+            self.a = ~self.a;
+            self.f.n = true;
+            self.f.h = true;
+            return 1;
+        }
+
+        // SCF / CCF : C = 1 ou C inversé ; N = H = 0, Z inchangé
+        if (op == 0x37 or op == 0x3F) {
+            self.f.c = if (op == 0x37) true else !self.f.c;
+            self.f.n = false;
+            self.f.h = false;
+            return 1;
+        }
+
+        // DI : immédiat, et annule un EI qui n'aurait pas encore pris effet
+        if (op == 0xF3) {
+            self.ime = false;
+            self.ime_pending = false;
+            return 1;
+        }
+
+        // EI : IME = 1 seulement après l'instruction suivante
+        if (op == 0xFB) {
+            self.ime_pending = true;
+            return 1;
+        }
+
+        // HALT : le réveil (IE & IF != 0) et le « HALT bug » viendront en phase 3
+        if (op == 0x76) {
+            self.halted = true;
+            return 1;
+        }
+
+        // STOP : suivi d'un octet ignoré (normalement 0x00)
+        if (op == 0x10) {
+            _ = self.fetch(bus);
+            self.stopped = true;
             return 1;
         }
 
@@ -617,10 +698,17 @@ test "LD r,(HL) : 2 M-cycles ; LD (HL),n : 3 M-cycles" {
     try expectEqual(@as(u8, 0x77), cpu.c);
 }
 
-test "0x76 (HALT) n'est pas un LD" {
+test "HALT (0x76, pas un LD) : le CPU s'arrête, PC ne bouge plus" {
     var buf: [32 * 1024]u8 = undefined;
-    var cpu, var bus = try setup(&buf, &.{0x76});
-    try std.testing.expectError(error.UnimplementedOpcode, cpu.step(&bus));
+    var cpu, var bus = try setup(&buf, &.{ 0x76, 0x04 });
+    cpu.b = 0x00;
+
+    try expectEqual(@as(u8, 1), try cpu.step(&bus));
+    try expectEqual(true, cpu.halted);
+    try expectEqual(@as(u16, 0xC001), cpu.pc);
+    try expectEqual(@as(u8, 1), try cpu.step(&bus)); // rien n'est exécuté
+    try expectEqual(@as(u16, 0xC001), cpu.pc);
+    try expectEqual(@as(u8, 0x00), cpu.b);
 }
 
 test "LD rr,nn : 3 M-cycles, little-endian" {
@@ -1143,4 +1231,87 @@ test "CB RES / SET : 2 M-cycles (4 sur (HL)), flags intacts" {
     try expectEqual(@as(u8, 4), try cpu.step(&bus)); // SET 0,(HL)
     try expectEqual(@as(u8, 0x71), bus.read(0xC100));
     try expectEqual(f, cpu.f);
+}
+
+test "DAA après une addition BCD" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0x80, 0x27, 0x80, 0x27, 0x80, 0x27 });
+    cpu.f = .{};
+
+    // 15 + 27 = 42 : 0x3C → 0x42 (quartet bas > 9)
+    cpu.a = 0x15;
+    cpu.b = 0x27;
+    _ = try cpu.step(&bus);
+    try expectAlu(&cpu, &bus, 1, 0x42, 0x00);
+
+    // 09 + 09 = 18 : 0x12 avec H → 0x18
+    cpu.a = 0x09;
+    cpu.b = 0x09;
+    _ = try cpu.step(&bus);
+    try expectAlu(&cpu, &bus, 1, 0x18, 0x00);
+
+    // 99 + 01 = 100 : 0x9A → 0x00, Z C
+    cpu.a = 0x99;
+    cpu.b = 0x01;
+    _ = try cpu.step(&bus);
+    try expectAlu(&cpu, &bus, 1, 0x00, 0x90);
+}
+
+test "DAA après une soustraction BCD : N conservé" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0x90, 0x27, 0x90, 0x27 });
+    cpu.f = .{};
+
+    // 42 - 15 = 27 : 0x2D avec H → 0x27
+    cpu.a = 0x42;
+    cpu.b = 0x15;
+    _ = try cpu.step(&bus);
+    try expectAlu(&cpu, &bus, 1, 0x27, 0x40); // N
+
+    // 10 - 20 = -10 → 90 avec emprunt : 0xF0 avec C → 0x90
+    cpu.a = 0x10;
+    cpu.b = 0x20;
+    _ = try cpu.step(&bus);
+    try expectAlu(&cpu, &bus, 1, 0x90, 0x50); // N C
+}
+
+test "CPL, SCF, CCF : 1 M-cycle, Z inchangé" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0x2F, 0x37, 0x3F, 0x3F });
+    cpu.f = .{ .z = true };
+    cpu.a = 0x35;
+
+    try expectAlu(&cpu, &bus, 1, 0xCA, 0xE0); // CPL : Z N H
+    try expectAlu(&cpu, &bus, 1, 0xCA, 0x90); // SCF : Z C
+    try expectAlu(&cpu, &bus, 1, 0xCA, 0x80); // CCF : C → 0
+    try expectAlu(&cpu, &bus, 1, 0xCA, 0x90); // CCF : C → 1
+}
+
+test "EI : IME à 1 seulement après l'instruction suivante ; DI immédiat" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0xFB, 0x00, 0x00, 0xF3, 0xFB, 0xF3, 0x00 });
+
+    try expectEqual(@as(u8, 1), try cpu.step(&bus)); // EI
+    try expectEqual(false, cpu.ime);
+    _ = try cpu.step(&bus); // NOP : s'exécute encore avec IME = 0
+    try expectEqual(true, cpu.ime);
+    _ = try cpu.step(&bus); // NOP
+    try expectEqual(@as(u8, 1), try cpu.step(&bus)); // DI
+    try expectEqual(false, cpu.ime);
+
+    _ = try cpu.step(&bus); // EI
+    _ = try cpu.step(&bus); // DI juste après : IME reste à 0
+    _ = try cpu.step(&bus); // NOP
+    try expectEqual(false, cpu.ime);
+}
+
+test "STOP : 2 octets, le CPU s'arrête" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0x10, 0x00, 0x04 });
+
+    try expectEqual(@as(u8, 1), try cpu.step(&bus));
+    try expectEqual(true, cpu.stopped);
+    try expectEqual(@as(u16, 0xC002), cpu.pc);
+    _ = try cpu.step(&bus);
+    try expectEqual(@as(u16, 0xC002), cpu.pc);
 }
