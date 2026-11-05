@@ -15,6 +15,21 @@ const std = @import("std");
 const cartridge = @import("cartridge.zig");
 const Cartridge = cartridge.Cartridge;
 
+/// Les 5 sources d'interruption, numérotées par leur bit dans IE et IF.
+/// Le numéro donne aussi la priorité (0 = la plus prioritaire)
+/// et le vecteur : 0x40 + 8 * bit.
+pub const Interrupt = enum(u3) {
+    vblank = 0,
+    lcd_stat = 1,
+    timer = 2,
+    serial = 3,
+    joypad = 4,
+
+    pub fn mask(self: Interrupt) u8 {
+        return @as(u8, 1) << @intFromEnum(self);
+    }
+};
+
 pub const Bus = struct {
     cart: Cartridge,
     vram: [0x2000]u8 = @splat(0),
@@ -22,6 +37,9 @@ pub const Bus = struct {
     oam: [0xA0]u8 = @splat(0),
     hram: [0x7F]u8 = @splat(0),
     ie: u8 = 0,
+    /// IF (0xFF0F) : interruptions demandées, une par bit (voir `Interrupt`).
+    /// Seuls les 5 bits bas existent ; on les garde masqués ici.
+    if_: u8 = 0,
     /// SB (0xFF01) : octet à envoyer sur le port série.
     sb: u8 = 0,
     /// SC (0xFF02) : contrôle du port série (bit 7 = transfert, bit 0 = horloge).
@@ -68,11 +86,19 @@ pub const Bus = struct {
         }
     }
 
+    /// Lève le drapeau d'une interruption dans IF. Appelée par le timer,
+    /// le PPU, le joypad... Le CPU décidera de la servir selon IME et IE.
+    pub fn requestInterrupt(self: *Bus, interrupt: Interrupt) void {
+        self.if_ |= interrupt.mask();
+    }
+
     fn readIo(self: *Bus, addr: u16) u8 {
         return switch (addr) {
             0xFF01 => self.sb,
             // Sur DMG, les bits 1 à 6 de SC n'existent pas et se lisent à 1.
             0xFF02 => self.sc | 0x7E,
+            // Les bits 5 à 7 de IF n'existent pas et se lisent à 1.
+            0xFF0F => self.if_ | 0xE0,
             else => blk: {
                 self.unimplemented_io_accesses += 1;
                 break :blk 0xFF;
@@ -93,6 +119,7 @@ pub const Bus = struct {
                     self.sc &= 0x7F;
                 }
             },
+            0xFF0F => self.if_ = value & 0x1F,
             else => self.unimplemented_io_accesses += 1,
         }
     }
@@ -183,4 +210,31 @@ test "port série : sans le bit 7, rien n'est envoyé" {
     bus.write(0xFF02, 0x01);
     try std.testing.expectEqual(@as(usize, 0), bus.serial.len);
     try std.testing.expectEqual(@as(u8, 'X'), bus.read(0xFF01));
+}
+
+test "IF : les bits 5-7 se lisent à 1" {
+    var buf: [32 * 1024]u8 = undefined;
+    var bus = try testBus(&buf);
+
+    try std.testing.expectEqual(@as(u8, 0xE0), bus.read(0xFF0F));
+    bus.write(0xFF0F, 0xFF);
+    try std.testing.expectEqual(@as(u8, 0xFF), bus.read(0xFF0F));
+    try std.testing.expectEqual(@as(u8, 0x1F), bus.if_);
+    bus.write(0xFF0F, 0x00);
+    try std.testing.expectEqual(@as(u8, 0xE0), bus.read(0xFF0F));
+    try std.testing.expectEqual(@as(u64, 0), bus.unimplemented_io_accesses);
+}
+
+test "requestInterrupt : lève le bon bit sans toucher aux autres" {
+    var buf: [32 * 1024]u8 = undefined;
+    var bus = try testBus(&buf);
+
+    bus.requestInterrupt(.timer);
+    try std.testing.expectEqual(@as(u8, 0xE4), bus.read(0xFF0F));
+    bus.requestInterrupt(.vblank);
+    bus.requestInterrupt(.joypad);
+    try std.testing.expectEqual(@as(u8, 0xF5), bus.read(0xFF0F));
+    // Demander deux fois la même ne change rien.
+    bus.requestInterrupt(.timer);
+    try std.testing.expectEqual(@as(u8, 0x15), bus.if_);
 }
