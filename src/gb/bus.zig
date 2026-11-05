@@ -15,7 +15,8 @@ const std = @import("std");
 const cartridge = @import("cartridge.zig");
 const Cartridge = cartridge.Cartridge;
 const Timer = @import("timer.zig").Timer;
-const Ppu = @import("ppu.zig").Ppu;
+const ppu_mod = @import("ppu.zig");
+const Ppu = ppu_mod.Ppu;
 
 /// Les 5 sources d'interruption, numérotées par leur bit dans IE et IF.
 /// Le numéro donne aussi la priorité (0 = la plus prioritaire)
@@ -50,7 +51,7 @@ pub const Bus = struct {
     serial: SerialOutput = .{},
     /// DIV, TIMA, TMA, TAC (0xFF04..0xFF07).
     timer: Timer = .{},
-    /// PPU : LCDC, STAT, LY, BGP (0xFF40, 0xFF41, 0xFF44, 0xFF47).
+    /// PPU : LCDC, STAT, LY, LYC, BGP (0xFF40, 0xFF41, 0xFF44, 0xFF45, 0xFF47).
     ppu: Ppu = .{},
     /// Imite l'émulateur qui a produit les journaux de Gameboy Doctor
     /// (tests/doctor.zig), au prix de deux écarts avec le vrai matériel :
@@ -102,8 +103,12 @@ pub const Bus = struct {
     pub fn tick(self: *Bus, m_cycles: u8) void {
         if (self.timer.tick(m_cycles)) self.requestInterrupt(.timer);
         // 4 dots (cycles d'horloge) par M-cycle.
-        const ppu_irq = self.ppu.tick(@as(u16, m_cycles) * 4);
-        if (ppu_irq.vblank) self.requestInterrupt(.vblank);
+        self.requestPpuInterrupts(self.ppu.tick(@as(u16, m_cycles) * 4));
+    }
+
+    fn requestPpuInterrupts(self: *Bus, irq: ppu_mod.Interrupts) void {
+        if (irq.vblank) self.requestInterrupt(.vblank);
+        if (irq.stat) self.requestInterrupt(.lcd_stat);
     }
 
     /// Lève le drapeau d'une interruption dans IF. Appelée par le timer,
@@ -120,7 +125,7 @@ pub const Bus = struct {
             0xFF04...0xFF07 => self.timer.read(addr),
             // Les bits 5 à 7 de IF n'existent pas et se lisent à 1.
             0xFF0F => if (self.doctor_mode) self.if_ else self.if_ | 0xE0,
-            0xFF40, 0xFF41, 0xFF47 => self.ppu.read(addr),
+            0xFF40, 0xFF41, 0xFF45, 0xFF47 => self.ppu.read(addr),
             0xFF44 => if (self.doctor_mode) 0x90 else self.ppu.read(addr),
             else => self.unimplementedRead(),
         };
@@ -146,7 +151,7 @@ pub const Bus = struct {
             },
             0xFF04...0xFF07 => if (self.timer.write(addr, value)) self.requestInterrupt(.timer),
             0xFF0F => self.if_ = value & 0x1F,
-            0xFF40, 0xFF41, 0xFF44, 0xFF47 => self.ppu.write(addr, value),
+            0xFF40, 0xFF41, 0xFF44, 0xFF45, 0xFF47 => self.requestPpuInterrupts(self.ppu.write(addr, value)),
             else => self.unimplemented_io_accesses += 1,
         }
     }
@@ -304,5 +309,26 @@ test "PPU : 144 lignes de M-cycles via le bus -> IF bit 0, LY = 144" {
     try std.testing.expectEqual(Interrupt.vblank.mask(), bus.if_);
     try std.testing.expectEqual(@as(u8, 144), bus.read(0xFF44));
     try std.testing.expectEqual(@as(u8, 0x81), bus.read(0xFF41) & 0x83);
+    try std.testing.expectEqual(@as(u64, 0), bus.unimplemented_io_accesses);
+}
+
+test "PPU : STAT LYC via le bus -> IF bit 1" {
+    var buf: [32 * 1024]u8 = undefined;
+    var bus = try testBus(&buf);
+
+    bus.write(0xFF45, 2);
+    bus.write(0xFF41, 0x40);
+    try std.testing.expectEqual(@as(u8, 2), bus.read(0xFF45));
+    // Ligne 2 = 2 × 456 dots = 228 M-cycles.
+    for (0..227) |_| bus.tick(1);
+    try std.testing.expectEqual(@as(u8, 0), bus.if_);
+    bus.tick(1);
+    try std.testing.expectEqual(Interrupt.lcd_stat.mask(), bus.if_);
+    try std.testing.expectEqual(@as(u8, 0x04), bus.read(0xFF41) & 0x04);
+    // Écrire dans LYC la ligne en cours la relève aussitôt.
+    bus.if_ = 0;
+    bus.write(0xFF45, 0);
+    bus.write(0xFF45, 2);
+    try std.testing.expectEqual(Interrupt.lcd_stat.mask(), bus.if_);
     try std.testing.expectEqual(@as(u64, 0), bus.unimplemented_io_accesses);
 }
