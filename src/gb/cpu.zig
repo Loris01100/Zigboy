@@ -4,6 +4,10 @@
 //!   x = bits 7-6, y = bits 5-3, z = bits 2-0
 //! Une valeur 0-7 de y ou z désigne un opérande dans l'ordre
 //! B, C, D, E, H, L, (HL), A.
+//! Pour les instructions 16 bits, p = y >> 1 désigne une paire :
+//!   rp  : BC, DE, HL, SP  (LD rr,nn)
+//!   rp2 : BC, DE, HL, AF  (PUSH / POP)
+//! et q = y & 1 distingue deux instructions de la même colonne.
 //!
 //! `step` exécute une instruction et renvoie son nombre de M-cycles.
 
@@ -52,8 +56,43 @@ pub const Cpu = struct {
         };
     }
 
+    // --- Paires de registres -------------------------------------------
+
+    pub fn af(self: *const Cpu) u16 {
+        return @as(u16, self.a) << 8 | @as(u8, @bitCast(self.f));
+    }
+
+    pub fn bc(self: *const Cpu) u16 {
+        return @as(u16, self.b) << 8 | self.c;
+    }
+
+    pub fn de(self: *const Cpu) u16 {
+        return @as(u16, self.d) << 8 | self.e;
+    }
+
     pub fn hl(self: *const Cpu) u16 {
         return @as(u16, self.h) << 8 | self.l;
+    }
+
+    /// Les 4 bits bas de F n'existent pas : ils sont forcés à 0.
+    pub fn setAf(self: *Cpu, value: u16) void {
+        self.a = @truncate(value >> 8);
+        self.f = @bitCast(@as(u8, @truncate(value)) & 0xF0);
+    }
+
+    pub fn setBc(self: *Cpu, value: u16) void {
+        self.b = @truncate(value >> 8);
+        self.c = @truncate(value);
+    }
+
+    pub fn setDe(self: *Cpu, value: u16) void {
+        self.d = @truncate(value >> 8);
+        self.e = @truncate(value);
+    }
+
+    pub fn setHl(self: *Cpu, value: u16) void {
+        self.h = @truncate(value >> 8);
+        self.l = @truncate(value);
     }
 
     /// Exécute une instruction et renvoie son nombre de M-cycles.
@@ -70,10 +109,36 @@ pub const Cpu = struct {
         return value;
     }
 
+    /// Lit un mot 16 bits little-endian (octet bas d'abord) à PC.
+    fn fetch16(self: *Cpu, bus: *Bus) u16 {
+        const lo = self.fetch(bus);
+        const hi = self.fetch(bus);
+        return @as(u16, hi) << 8 | lo;
+    }
+
+    /// Empile un mot : SP descend, octet haut écrit en premier.
+    fn push(self: *Cpu, bus: *Bus, value: u16) void {
+        self.sp -%= 1;
+        bus.write(self.sp, @truncate(value >> 8));
+        self.sp -%= 1;
+        bus.write(self.sp, @truncate(value));
+    }
+
+    /// Dépile un mot : octet bas lu en premier, SP remonte.
+    fn pop(self: *Cpu, bus: *Bus) u16 {
+        const lo = bus.read(self.sp);
+        self.sp +%= 1;
+        const hi = bus.read(self.sp);
+        self.sp +%= 1;
+        return @as(u16, hi) << 8 | lo;
+    }
+
     fn execute(self: *Cpu, bus: *Bus, comptime op: u8) Error!u8 {
         const x: u2 = @truncate(op >> 6);
         const y: u3 = @truncate(op >> 3);
         const z: u3 = @truncate(op);
+        const p: u2 = @truncate(y >> 1);
+        const q: u1 = @truncate(y);
 
         // NOP
         if (op == 0x00) return 1;
@@ -91,7 +156,66 @@ pub const Cpu = struct {
             return if (y == 6 or z == 6) 2 else 1;
         }
 
+        // LD rr,nn
+        if (x == 0 and z == 1 and q == 0) {
+            self.writeRp(p, self.fetch16(bus));
+            return 3;
+        }
+
+        // LD (nn),SP : octet bas à nn, octet haut à nn+1
+        if (op == 0x08) {
+            const addr = self.fetch16(bus);
+            bus.write(addr, @truncate(self.sp));
+            bus.write(addr +% 1, @truncate(self.sp >> 8));
+            return 5;
+        }
+
+        // LD SP,HL
+        if (op == 0xF9) {
+            self.sp = self.hl();
+            return 2;
+        }
+
+        // POP rr
+        if (x == 3 and z == 1 and q == 0) {
+            self.writeRp2(p, self.pop(bus));
+            return 3;
+        }
+
+        // PUSH rr
+        if (x == 3 and z == 5 and q == 0) {
+            self.push(bus, self.readRp2(p));
+            return 4;
+        }
+
         return error.UnimplementedOpcode;
+    }
+
+    fn writeRp(self: *Cpu, comptime i: u2, value: u16) void {
+        switch (i) {
+            0 => self.setBc(value),
+            1 => self.setDe(value),
+            2 => self.setHl(value),
+            3 => self.sp = value,
+        }
+    }
+
+    fn readRp2(self: *const Cpu, comptime i: u2) u16 {
+        return switch (i) {
+            0 => self.bc(),
+            1 => self.de(),
+            2 => self.hl(),
+            3 => self.af(),
+        };
+    }
+
+    fn writeRp2(self: *Cpu, comptime i: u2, value: u16) void {
+        switch (i) {
+            0 => self.setBc(value),
+            1 => self.setDe(value),
+            2 => self.setHl(value),
+            3 => self.setAf(value),
+        }
     }
 
     fn readR(self: *Cpu, bus: *Bus, comptime i: u3) u8 {
@@ -202,4 +326,82 @@ test "0x76 (HALT) n'est pas un LD" {
     var buf: [32 * 1024]u8 = undefined;
     var cpu, var bus = try setup(&buf, &.{0x76});
     try std.testing.expectError(error.UnimplementedOpcode, cpu.step(&bus));
+}
+
+test "LD rr,nn : 3 M-cycles, little-endian" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{
+        0x01, 0x34, 0x12, // LD BC,0x1234
+        0x11, 0x78, 0x56, // LD DE,0x5678
+        0x21, 0xBC, 0x9A, // LD HL,0x9ABC
+        0x31, 0xF0, 0xDF, // LD SP,0xDFF0
+    });
+
+    try expectEqual(@as(u8, 3), try cpu.step(&bus));
+    try expectEqual(@as(u16, 0x1234), cpu.bc());
+    try expectEqual(@as(u8, 3), try cpu.step(&bus));
+    try expectEqual(@as(u16, 0x5678), cpu.de());
+    try expectEqual(@as(u8, 3), try cpu.step(&bus));
+    try expectEqual(@as(u16, 0x9ABC), cpu.hl());
+    try expectEqual(@as(u8, 3), try cpu.step(&bus));
+    try expectEqual(@as(u16, 0xDFF0), cpu.sp);
+    try expectEqual(@as(u16, 0xC00C), cpu.pc);
+}
+
+test "LD (nn),SP : 5 M-cycles, octet bas en premier" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0x08, 0x00, 0xC1 });
+    cpu.sp = 0xBEEF;
+
+    try expectEqual(@as(u8, 5), try cpu.step(&bus));
+    try expectEqual(@as(u8, 0xEF), bus.read(0xC100));
+    try expectEqual(@as(u8, 0xBE), bus.read(0xC101));
+}
+
+test "LD SP,HL : 2 M-cycles" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{0xF9});
+    cpu.setHl(0xD000);
+
+    try expectEqual(@as(u8, 2), try cpu.step(&bus));
+    try expectEqual(@as(u16, 0xD000), cpu.sp);
+}
+
+test "PUSH BC : 4 M-cycles, SP -= 2, octet haut à SP+1" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{0xC5});
+    cpu.sp = 0xD000;
+    cpu.setBc(0x1234);
+
+    try expectEqual(@as(u8, 4), try cpu.step(&bus));
+    try expectEqual(@as(u16, 0xCFFE), cpu.sp);
+    try expectEqual(@as(u8, 0x12), bus.read(0xCFFF));
+    try expectEqual(@as(u8, 0x34), bus.read(0xCFFE));
+}
+
+test "PUSH DE puis POP HL : 3 M-cycles, copie DE dans HL" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0xD5, 0xE1 });
+    cpu.sp = 0xD000;
+    cpu.setDe(0xCAFE);
+
+    _ = try cpu.step(&bus);
+    try expectEqual(@as(u8, 3), try cpu.step(&bus));
+    try expectEqual(@as(u16, 0xCAFE), cpu.hl());
+    try expectEqual(@as(u16, 0xD000), cpu.sp);
+}
+
+test "POP AF : les 4 bits bas de F restent à 0" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0xC5, 0xF1, 0xF5 });
+    cpu.sp = 0xD000;
+    cpu.setBc(0x12FF);
+
+    _ = try cpu.step(&bus); // PUSH BC
+    _ = try cpu.step(&bus); // POP AF
+    try expectEqual(@as(u16, 0x12F0), cpu.af());
+    try expectEqual(true, cpu.f.z and cpu.f.n and cpu.f.h and cpu.f.c);
+
+    _ = try cpu.step(&bus); // PUSH AF
+    try expectEqual(@as(u8, 0xF0), bus.read(0xCFFE));
 }
