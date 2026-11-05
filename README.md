@@ -16,8 +16,20 @@
 zig build                   # compile l'exécutable dans zig-out/bin/
 zig build run -- <rom.gb>   # lance l'émulateur sur une ROM
 zig build test              # lance tous les tests (cœur et exécutable)
-zig fmt build.zig src       # formate le code (la CI fait --check)
+zig build sst               # SingleStepTests du CPU (voir plus bas)
+zig build sst -- 27 cb37    # seulement certains opcodes (ici DAA et SWAP A)
+zig fmt build.zig src tests # formate le code (la CI fait --check)
 ```
+
+### SingleStepTests
+
+[SingleStepTests sm83](https://github.com/SingleStepTests/sm83) : 1000 cas JSON par opcode (état avant, état après, M-cycles). Les données (160 Mo) ne sont pas versionnées. Pour les récupérer :
+
+```sh
+git clone --depth 1 https://github.com/SingleStepTests/sm83.git test-roms/sm83
+```
+
+Le harnais ([tests/sst.zig](tests/sst.zig)) branche le CPU sur une mémoire plate de 64 Kio, comme le demandent ces tests. Il affiche le détail du premier cas faux de chaque opcode.
 
 ## Structure
 

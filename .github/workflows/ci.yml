@@ -19,7 +19,7 @@ jobs:
       - uses: mlugg/setup-zig@v2
 
       - name: Formatage
-        run: zig fmt --check build.zig src
+        run: zig fmt --check build.zig src tests
 
       - name: Tests
         run: zig build test --summary all

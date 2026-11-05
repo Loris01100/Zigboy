@@ -11,9 +11,13 @@
 //! Pour les sauts conditionnels, cc = y & 3 : NZ, Z, NC, C.
 //!
 //! `step` exécute une instruction et renvoie son nombre de M-cycles.
+//!
+//! Le bus est un paramètre `anytype` : tout type qui fournit
+//! `read(addr: u16) u8` et `write(addr: u16, value: u8)` convient.
+//! L'émulateur passe le vrai `Bus` ; le harnais SingleStepTests passe
+//! une mémoire plate de 64 Kio. Zig compile une version par type.
 
 const std = @import("std");
-const Bus = @import("bus.zig").Bus;
 
 pub const Error = error{
     /// Opcode pas encore implémenté.
@@ -111,7 +115,7 @@ pub const Cpu = struct {
 
     /// Exécute une instruction et renvoie son nombre de M-cycles.
     /// En HALT ou STOP, le CPU est à l'arrêt : 1 M-cycle sans rien lire.
-    pub fn step(self: *Cpu, bus: *Bus) Error!u8 {
+    pub fn step(self: *Cpu, bus: anytype) Error!u8 {
         if (self.halted or self.stopped) return 1;
         // Délai de EI : l'instruction qui suit EI s'exécute encore avec
         // l'ancien IME ; les interruptions ne seront vues qu'après elle.
@@ -125,21 +129,21 @@ pub const Cpu = struct {
         };
     }
 
-    fn fetch(self: *Cpu, bus: *Bus) u8 {
+    fn fetch(self: *Cpu, bus: anytype) u8 {
         const value = bus.read(self.pc);
         self.pc +%= 1;
         return value;
     }
 
     /// Lit un mot 16 bits little-endian (octet bas d'abord) à PC.
-    fn fetch16(self: *Cpu, bus: *Bus) u16 {
+    fn fetch16(self: *Cpu, bus: anytype) u16 {
         const lo = self.fetch(bus);
         const hi = self.fetch(bus);
         return @as(u16, hi) << 8 | lo;
     }
 
     /// Empile un mot : SP descend, octet haut écrit en premier.
-    fn push(self: *Cpu, bus: *Bus, value: u16) void {
+    fn push(self: *Cpu, bus: anytype, value: u16) void {
         self.sp -%= 1;
         bus.write(self.sp, @truncate(value >> 8));
         self.sp -%= 1;
@@ -147,7 +151,7 @@ pub const Cpu = struct {
     }
 
     /// Dépile un mot : octet bas lu en premier, SP remonte.
-    fn pop(self: *Cpu, bus: *Bus) u16 {
+    fn pop(self: *Cpu, bus: anytype) u16 {
         const lo = bus.read(self.sp);
         self.sp +%= 1;
         const hi = bus.read(self.sp);
@@ -155,7 +159,7 @@ pub const Cpu = struct {
         return @as(u16, hi) << 8 | lo;
     }
 
-    fn execute(self: *Cpu, bus: *Bus, comptime op: u8) Error!u8 {
+    fn execute(self: *Cpu, bus: anytype, comptime op: u8) Error!u8 {
         const x: u2 = @truncate(op >> 6);
         const y: u3 = @truncate(op >> 3);
         const z: u3 = @truncate(op);
@@ -441,7 +445,7 @@ pub const Cpu = struct {
     ///   x = 2 : RES y,r[z]
     ///   x = 3 : SET y,r[z]
     /// Les 256 combinaisons sont valides.
-    fn executeCb(self: *Cpu, bus: *Bus, comptime op: u8) u8 {
+    fn executeCb(self: *Cpu, bus: anytype, comptime op: u8) u8 {
         const x: u2 = @truncate(op >> 6);
         const y: u3 = @truncate(op >> 3);
         const z: u3 = @truncate(op);
@@ -594,7 +598,7 @@ pub const Cpu = struct {
         }
     }
 
-    fn readR(self: *Cpu, bus: *Bus, comptime i: u3) u8 {
+    fn readR(self: *Cpu, bus: anytype, comptime i: u3) u8 {
         return switch (i) {
             0 => self.b,
             1 => self.c,
@@ -607,7 +611,7 @@ pub const Cpu = struct {
         };
     }
 
-    fn writeR(self: *Cpu, bus: *Bus, comptime i: u3, value: u8) void {
+    fn writeR(self: *Cpu, bus: anytype, comptime i: u3, value: u8) void {
         switch (i) {
             0 => self.b = value,
             1 => self.c = value,
@@ -624,6 +628,7 @@ pub const Cpu = struct {
 // --- Tests -----------------------------------------------------------------
 
 const cartridge = @import("cartridge.zig");
+const Bus = @import("bus.zig").Bus;
 
 /// Bus sur une ROM ONLY vide, et CPU qui exécute `program` depuis la WRAM.
 fn setup(buf: *[32 * 1024]u8, program: []const u8) !struct { Cpu, Bus } {
