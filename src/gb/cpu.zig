@@ -334,7 +334,72 @@ pub const Cpu = struct {
             return 4;
         }
 
+        // RLCA, RRCA, RLA, RRA : comme leurs versions CB sur A,
+        // mais Z vaut toujours 0 et 1 seul M-cycle
+        if (x == 0 and z == 7 and y < 4) {
+            self.a = self.rot(@truncate(y), self.a);
+            self.f.z = false;
+            return 1;
+        }
+
+        // Préfixe CB : un second octet choisit l'instruction.
+        // Les 4 M-cycles de base incluent la lecture des deux octets.
+        if (op == 0xCB) {
+            const cb = self.fetch(bus);
+            return switch (cb) {
+                inline else => |cb_op| self.executeCb(bus, cb_op),
+            };
+        }
+
         return error.UnimplementedOpcode;
+    }
+
+    /// Opcodes préfixés CB, décodés avec les mêmes champs x, y, z :
+    ///   x = 0 : rotation / décalage y sur r[z]
+    ///   x = 1 : BIT y,r[z]
+    ///   x = 2 : RES y,r[z]
+    ///   x = 3 : SET y,r[z]
+    /// Les 256 combinaisons sont valides.
+    fn executeCb(self: *Cpu, bus: *Bus, comptime op: u8) u8 {
+        const x: u2 = @truncate(op >> 6);
+        const y: u3 = @truncate(op >> 3);
+        const z: u3 = @truncate(op);
+        const mask: u8 = @as(u8, 1) << y;
+        const v = self.readR(bus, z);
+
+        switch (x) {
+            0 => self.writeR(bus, z, self.rot(y, v)),
+            // BIT : Z = bit testé inversé, C inchangé, pas d'écriture
+            1 => {
+                self.f.z = v & mask == 0;
+                self.f.n = false;
+                self.f.h = true;
+                return if (z == 6) 3 else 2;
+            },
+            2 => self.writeR(bus, z, v & ~mask),
+            3 => self.writeR(bus, z, v | mask),
+        }
+        // (HL) : lecture + écriture mémoire en plus
+        return if (z == 6) 4 else 2;
+    }
+
+    /// Rotations et décalages, dans l'ordre de y :
+    /// RLC, RRC, RL, RR, SLA, SRA, SWAP, SRL.
+    /// Le bit sorti va dans C ; Z selon le résultat ; N = H = 0.
+    fn rot(self: *Cpu, comptime op: u3, v: u8) u8 {
+        const old_c: u8 = @intFromBool(self.f.c);
+        const r: u8, const c: bool = switch (op) {
+            0 => .{ v << 1 | v >> 7, v & 0x80 != 0 }, // RLC : bit 7 → bit 0 et C
+            1 => .{ v >> 1 | v << 7, v & 0x01 != 0 }, // RRC : bit 0 → bit 7 et C
+            2 => .{ v << 1 | old_c, v & 0x80 != 0 }, // RL : à travers C
+            3 => .{ v >> 1 | old_c << 7, v & 0x01 != 0 }, // RR : à travers C
+            4 => .{ v << 1, v & 0x80 != 0 }, // SLA : 0 entre à droite
+            5 => .{ v >> 1 | (v & 0x80), v & 0x01 != 0 }, // SRA : le bit 7 (signe) reste
+            6 => .{ v << 4 | v >> 4, false }, // SWAP : échange les quartets
+            7 => .{ v >> 1, v & 0x01 != 0 }, // SRL : 0 entre à gauche
+        };
+        self.f = .{ .z = r == 0, .c = c };
+        return r;
     }
 
     /// Condition des sauts : NZ, Z, NC, C.
@@ -966,4 +1031,116 @@ test "RST : 4 M-cycles, saut à y * 8, adresse de retour empilée" {
     cpu.pc = 0xC001;
     _ = try cpu.step(&bus); // RST 00h
     try expectEqual(@as(u16, 0x0000), cpu.pc);
+}
+
+test "RLCA / RRCA : 1 M-cycle, Z toujours 0" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0x07, 0x0F, 0x07 });
+    cpu.f = .{ .z = true, .n = true, .h = true };
+
+    cpu.a = 0x85;
+    try expectAlu(&cpu, &bus, 1, 0x0B, 0x10); // bit 7 → bit 0 et C
+    try expectAlu(&cpu, &bus, 1, 0x85, 0x10); // bit 0 → bit 7 et C
+    cpu.a = 0x00;
+    try expectAlu(&cpu, &bus, 1, 0x00, 0x00); // résultat nul, mais Z = 0
+}
+
+test "RLA / RRA : rotation à travers C" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0x17, 0x17, 0x1F, 0x1F });
+    cpu.f = .{};
+
+    cpu.a = 0x80;
+    try expectAlu(&cpu, &bus, 1, 0x00, 0x10); // le bit 7 part dans C
+    try expectAlu(&cpu, &bus, 1, 0x01, 0x00); // l'ancien C entre au bit 0
+    try expectAlu(&cpu, &bus, 1, 0x00, 0x10); // le bit 0 part dans C
+    try expectAlu(&cpu, &bus, 1, 0x80, 0x00); // l'ancien C entre au bit 7
+}
+
+test "CB RLC / RRC / RL / RR : 2 M-cycles, Z calculé" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0xCB, 0x00, 0xCB, 0x09, 0xCB, 0x12, 0xCB, 0x1F });
+    cpu.f = .{};
+
+    cpu.b = 0x80;
+    try expectEqual(@as(u8, 2), try cpu.step(&bus)); // RLC B
+    try expectEqual(@as(u8, 0x01), cpu.b);
+    try expectEqual(@as(u8, 0x10), @as(u8, @bitCast(cpu.f))); // C
+
+    cpu.c = 0x00;
+    _ = try cpu.step(&bus); // RRC C
+    try expectEqual(@as(u8, 0x00), cpu.c);
+    try expectEqual(@as(u8, 0x80), @as(u8, @bitCast(cpu.f))); // Z (contrairement à RRCA)
+
+    cpu.d = 0x80;
+    _ = try cpu.step(&bus); // RL D, C = 0
+    try expectEqual(@as(u8, 0x00), cpu.d);
+    try expectEqual(@as(u8, 0x90), @as(u8, @bitCast(cpu.f))); // Z C
+
+    cpu.a = 0x02;
+    try expectAlu(&cpu, &bus, 2, 0x81, 0x00); // RR A : l'ancien C entre au bit 7
+}
+
+test "CB SLA / SRA / SWAP / SRL" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0xCB, 0x27, 0xCB, 0x2F, 0xCB, 0x37, 0xCB, 0x3F, 0xCB, 0x37 });
+    cpu.f = .{ .c = true };
+
+    cpu.a = 0xC1;
+    try expectAlu(&cpu, &bus, 2, 0x82, 0x10); // SLA : 0 entre, bit 7 → C
+    try expectAlu(&cpu, &bus, 2, 0xC1, 0x00); // SRA : bit 7 recopié
+    try expectAlu(&cpu, &bus, 2, 0x1C, 0x00); // SWAP
+    cpu.f = .{ .c = true };
+    try expectAlu(&cpu, &bus, 2, 0x0E, 0x00); // SRL : 0 entre au bit 7, C = 0
+    cpu.a = 0x00;
+    try expectAlu(&cpu, &bus, 2, 0x00, 0x80); // SWAP de 0 : Z, C effacé
+}
+
+test "CB rotation sur (HL) : 4 M-cycles" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0xCB, 0x06, 0xCB, 0x3E });
+    cpu.setHl(0xC100);
+    bus.write(0xC100, 0x81);
+
+    try expectEqual(@as(u8, 4), try cpu.step(&bus)); // RLC (HL)
+    try expectEqual(@as(u8, 0x03), bus.read(0xC100));
+    try expectEqual(@as(u8, 4), try cpu.step(&bus)); // SRL (HL)
+    try expectEqual(@as(u8, 0x01), bus.read(0xC100));
+    try expectEqual(true, cpu.f.c);
+}
+
+test "CB BIT : 2 M-cycles (3 sur (HL)), C inchangé, rien écrit" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0xCB, 0x7F, 0xCB, 0x47, 0xCB, 0x46 });
+    cpu.f = .{ .c = true, .n = true };
+    cpu.a = 0x80;
+    cpu.setHl(0xC100);
+    bus.write(0xC100, 0xFE);
+
+    try expectAlu(&cpu, &bus, 2, 0x80, 0x30); // BIT 7,A : bit à 1 → Z = 0, H C
+    try expectAlu(&cpu, &bus, 2, 0x80, 0xB0); // BIT 0,A : bit à 0 → Z H C
+    try expectEqual(@as(u8, 3), try cpu.step(&bus)); // BIT 0,(HL)
+    try expectEqual(true, cpu.f.z);
+    try expectEqual(@as(u8, 0xFE), bus.read(0xC100));
+}
+
+test "CB RES / SET : 2 M-cycles (4 sur (HL)), flags intacts" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0xCB, 0x87, 0xCB, 0xF8, 0xCB, 0xBE, 0xCB, 0xC6 });
+    cpu.f = .{ .z = true, .c = true };
+    const f = cpu.f;
+    cpu.a = 0xFF;
+    cpu.b = 0x00;
+    cpu.setHl(0xC100);
+    bus.write(0xC100, 0xF0);
+
+    try expectEqual(@as(u8, 2), try cpu.step(&bus)); // RES 0,A
+    try expectEqual(@as(u8, 0xFE), cpu.a);
+    try expectEqual(@as(u8, 2), try cpu.step(&bus)); // SET 7,B
+    try expectEqual(@as(u8, 0x80), cpu.b);
+    try expectEqual(@as(u8, 4), try cpu.step(&bus)); // RES 7,(HL)
+    try expectEqual(@as(u8, 0x70), bus.read(0xC100));
+    try expectEqual(@as(u8, 4), try cpu.step(&bus)); // SET 0,(HL)
+    try expectEqual(@as(u8, 0x71), bus.read(0xC100));
+    try expectEqual(f, cpu.f);
 }
