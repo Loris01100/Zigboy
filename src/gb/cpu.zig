@@ -188,7 +188,86 @@ pub const Cpu = struct {
             return 4;
         }
 
+        // ALU A,r : y choisit l'opération, z l'opérande
+        if (x == 2) {
+            self.alu(y, self.readR(bus, z));
+            return if (z == 6) 2 else 1;
+        }
+
+        // ALU A,n : même chose avec un octet immédiat
+        if (x == 3 and z == 6) {
+            self.alu(y, self.fetch(bus));
+            return 2;
+        }
+
+        // INC r  (lecture + écriture de (HL) pour y = 6)
+        if (x == 0 and z == 4) {
+            const v = self.readR(bus, y);
+            const r = v +% 1;
+            self.f.z = r == 0;
+            self.f.n = false;
+            self.f.h = v & 0x0F == 0x0F;
+            self.writeR(bus, y, r);
+            return if (y == 6) 3 else 1;
+        }
+
+        // DEC r
+        if (x == 0 and z == 5) {
+            const v = self.readR(bus, y);
+            const r = v -% 1;
+            self.f.z = r == 0;
+            self.f.n = true;
+            self.f.h = v & 0x0F == 0;
+            self.writeR(bus, y, r);
+            return if (y == 6) 3 else 1;
+        }
+
         return error.UnimplementedOpcode;
+    }
+
+    /// Opérations ALU 8 bits sur A, dans l'ordre de y :
+    /// ADD, ADC, SUB, SBC, AND, XOR, OR, CP.
+    fn alu(self: *Cpu, comptime op: u3, v: u8) void {
+        const a = self.a;
+        switch (op) {
+            // ADD / ADC
+            0, 1 => {
+                const carry: u8 = if (op == 1 and self.f.c) 1 else 0;
+                const sum = @as(u16, a) + v + carry;
+                const r: u8 = @truncate(sum);
+                self.f = .{
+                    .z = r == 0,
+                    .h = (a & 0x0F) + (v & 0x0F) + carry > 0x0F,
+                    .c = sum > 0xFF,
+                };
+                self.a = r;
+            },
+            // SUB / SBC / CP (CP = SUB sans garder le résultat)
+            2, 3, 7 => {
+                const carry: u8 = if (op == 3 and self.f.c) 1 else 0;
+                const r = a -% v -% carry;
+                self.f = .{
+                    .z = r == 0,
+                    .n = true,
+                    .h = @as(u16, a & 0x0F) < @as(u16, v & 0x0F) + carry,
+                    .c = @as(u16, a) < @as(u16, v) + carry,
+                };
+                if (op != 7) self.a = r;
+            },
+            // AND : H vaut toujours 1
+            4 => {
+                self.a = a & v;
+                self.f = .{ .z = self.a == 0, .h = true };
+            },
+            5 => {
+                self.a = a ^ v;
+                self.f = .{ .z = self.a == 0 };
+            },
+            6 => {
+                self.a = a | v;
+                self.f = .{ .z = self.a == 0 };
+            },
+        }
     }
 
     fn writeRp(self: *Cpu, comptime i: u2, value: u16) void {
@@ -404,4 +483,123 @@ test "POP AF : les 4 bits bas de F restent à 0" {
 
     _ = try cpu.step(&bus); // PUSH AF
     try expectEqual(@as(u8, 0xF0), bus.read(0xCFFE));
+}
+
+/// Exécute une instruction et vérifie A, F (z n h c) et le nombre de M-cycles.
+fn expectAlu(cpu: *Cpu, bus: *Bus, cycles: u8, a: u8, f: u8) !void {
+    try expectEqual(cycles, try cpu.step(bus));
+    try expectEqual(a, cpu.a);
+    try expectEqual(f, @as(u8, @bitCast(cpu.f)));
+}
+
+test "ADD A,B : demi-retenue et retenue" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0x80, 0x80, 0x80 });
+    cpu.f = .{};
+
+    cpu.a = 0x0F;
+    cpu.b = 0x01;
+    try expectAlu(&cpu, &bus, 1, 0x10, 0x20); // H
+    cpu.a = 0xF0;
+    cpu.b = 0x10;
+    try expectAlu(&cpu, &bus, 1, 0x00, 0x90); // Z C
+    cpu.a = 0x12;
+    cpu.b = 0x34;
+    try expectAlu(&cpu, &bus, 1, 0x46, 0x00);
+}
+
+test "ADC A,n : ajoute la retenue, 2 M-cycles" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0xCE, 0x0E, 0xCE, 0xFF });
+    cpu.a = 0x01;
+    cpu.f = .{ .c = true };
+
+    try expectAlu(&cpu, &bus, 2, 0x10, 0x20); // 1 + 0x0E + 1 : H
+    cpu.f = .{ .c = true };
+    try expectAlu(&cpu, &bus, 2, 0x10, 0x30); // 0x10 + 0xFF + 1 : H C
+}
+
+test "SUB et SBC : emprunts" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0x90, 0x90, 0x98 });
+    cpu.f = .{};
+
+    cpu.a = 0x10;
+    cpu.b = 0x01;
+    try expectAlu(&cpu, &bus, 1, 0x0F, 0x60); // N H
+    cpu.a = 0x00;
+    cpu.b = 0x01;
+    try expectAlu(&cpu, &bus, 1, 0xFF, 0x70); // N H C
+    // SBC A,B avec C = 1 : 0xFF - 0xFE - 1 = 0
+    cpu.b = 0xFE;
+    try expectAlu(&cpu, &bus, 1, 0x00, 0xC0); // Z N
+}
+
+test "SBC A,n : la retenue compte dans H et C" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0xDE, 0x0F });
+    cpu.a = 0x0F;
+    cpu.f = .{ .c = true };
+    try expectAlu(&cpu, &bus, 2, 0xFF, 0x70); // 0x0F - 0x0F - 1
+}
+
+test "AND, XOR, OR" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0xA0, 0xAF, 0xB1 });
+    cpu.f = .{ .c = true, .n = true };
+
+    cpu.a = 0xF0;
+    cpu.b = 0x0F;
+    try expectAlu(&cpu, &bus, 1, 0x00, 0xA0); // AND B : Z H
+    cpu.a = 0x5A;
+    try expectAlu(&cpu, &bus, 1, 0x00, 0x80); // XOR A : Z
+    cpu.c = 0x81;
+    try expectAlu(&cpu, &bus, 1, 0x81, 0x00); // OR C
+}
+
+test "CP (HL) : 2 M-cycles, A inchangé" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0xBE, 0xFE, 0x42 });
+    cpu.setHl(0xC100);
+    bus.write(0xC100, 0x42);
+    cpu.a = 0x42;
+    cpu.f = .{};
+
+    try expectAlu(&cpu, &bus, 2, 0x42, 0xC0); // égal : Z N
+    try expectAlu(&cpu, &bus, 2, 0x42, 0xC0); // CP n
+}
+
+test "INC / DEC r : C inchangé" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0x04, 0x05, 0x3C, 0x3D });
+    cpu.f = .{ .c = true };
+
+    cpu.b = 0xFF;
+    try expectEqual(@as(u8, 1), try cpu.step(&bus)); // INC B
+    try expectEqual(@as(u8, 0x00), cpu.b);
+    try expectEqual(@as(u8, 0xB0), @as(u8, @bitCast(cpu.f))); // Z H C
+    try expectEqual(@as(u8, 1), try cpu.step(&bus)); // DEC B
+    try expectEqual(@as(u8, 0xFF), cpu.b);
+    try expectEqual(@as(u8, 0x70), @as(u8, @bitCast(cpu.f))); // N H C
+
+    cpu.a = 0x01;
+    cpu.f = .{};
+    try expectAlu(&cpu, &bus, 1, 0x02, 0x00); // INC A
+    try expectAlu(&cpu, &bus, 1, 0x01, 0x40); // DEC A : N
+}
+
+test "INC (HL) / DEC (HL) : 3 M-cycles" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0x34, 0x35, 0x35 });
+    cpu.setHl(0xC100);
+    bus.write(0xC100, 0x0F);
+
+    try expectEqual(@as(u8, 3), try cpu.step(&bus));
+    try expectEqual(@as(u8, 0x10), bus.read(0xC100));
+    try expectEqual(@as(u8, 3), try cpu.step(&bus));
+    try expectEqual(@as(u8, 0x0F), bus.read(0xC100));
+    try expectEqual(true, cpu.f.h and cpu.f.n);
+    bus.write(0xC100, 0x01);
+    _ = try cpu.step(&bus);
+    try expectEqual(true, cpu.f.z);
 }
