@@ -94,6 +94,29 @@ pub fn build(b: *std.Build) void {
     sst_cmd.addPassthruArgs();
     sst_step.dependOn(&sst_cmd.step);
 
+    // zig build acid2 : compare l'écran de dmg-acid2 à l'image de référence
+    // (voir tests/acid2.zig). Pas encore dans `zig build test` ni en CI :
+    // l'image ne sera juste qu'avec la fenêtre et les sprites.
+    const acid2_optimize: std.builtin.OptimizeMode = .ReleaseSafe;
+    const acid2 = b.addExecutable(.{
+        .name = "acid2",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/acid2.zig"),
+            .target = target,
+            .optimize = acid2_optimize,
+            .imports = &.{.{ .name = "gb", .module = b.createModule(.{
+                .root_source_file = b.path("src/gb/gameboy.zig"),
+                .target = target,
+                .optimize = acid2_optimize,
+            }) }},
+        }),
+    });
+    const acid2_step = b.step("acid2", "Compare l'écran de dmg-acid2 à la référence");
+    const acid2_cmd = b.addRunArtifact(acid2);
+    acid2_cmd.setCwd(b.path("."));
+    acid2_cmd.has_side_effects = true;
+    acid2_step.dependOn(&acid2_cmd.step);
+
     // zig build doctor -- <rom.gb> <journal.log> : journal pour Gameboy Doctor
     // (voir tests/doctor.zig). ReleaseFast : plusieurs millions de lignes.
     const doctor = b.addExecutable(.{

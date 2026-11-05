@@ -20,6 +20,8 @@ pub const timer = @import("timer.zig");
 pub const Timer = timer.Timer;
 pub const ppu = @import("ppu.zig");
 pub const Ppu = ppu.Ppu;
+pub const ppm = @import("ppm.zig");
+pub const writePpm = ppm.writePpm;
 
 /// La machine complète : le CPU et le bus, qui porte la mémoire et les
 /// périphériques (timer sur 0xFF04..0xFF07, PPU, port série, IF/IE...).
