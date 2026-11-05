@@ -63,9 +63,14 @@ const Case = struct {
 
 /// Opcodes ignorés quand aucun filtre n'est donné. Les données viennent
 /// d'Ares, qui modélise ces deux instructions autrement que les Pan Docs
-/// (et que nous) : HALT y coûte 3 M-cycles, STOP y fait 1 octet au lieu
-/// de 2. Leur vrai comportement dépend des interruptions (phase 3) et
-/// du joypad (phase 5) ; on les vérifiera alors avec des ROMs de test.
+/// (et que nous) :
+/// - HALT : revu en phase 3. Les 1000 cas ont IE = 0, donc aucune
+///   interruption en attente : ils ne testent ni le réveil ni le HALT bug.
+///   Registres et PC sont justes ; seul le nombre de M-cycles diffère
+///   (3 chez Ares, qui compte deux cycles d'arrêt, contre 1 chez nous :
+///   le temps passé en HALT est compté à part, 1 M-cycle par `step`).
+///   Le réveil et le HALT bug sont couverts par les tests de cpu.zig.
+/// - STOP : 1 octet au lieu de 2. Il dépend du joypad (phase 5).
 const skipped = [_]u8{ 0x10, 0x76 };
 
 var bus: FlatBus = undefined;
@@ -205,6 +210,7 @@ fn runCase(case: *const Case, report: bool) !bool {
         .ime = in.ime == 1,
         .ime_pending = in.ei == 1,
         .halted = false,
+        .halt_bug = false,
         .stopped = false,
     };
 

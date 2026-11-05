@@ -49,8 +49,11 @@ pub const Cpu = struct {
     /// Posé par EI : IME passe à 1 au début de l'instruction suivante,
     /// donc après qu'elle s'est exécutée côté interruptions.
     ime_pending: bool,
-    /// HALT : le CPU ne fait plus rien jusqu'à une interruption (phase 3).
+    /// HALT : le CPU ne fait plus rien jusqu'à ce que IE & IF != 0.
     halted: bool,
+    /// « HALT bug » : le prochain fetch lit l'octet sans avancer PC,
+    /// qui est donc lu deux fois.
+    halt_bug: bool,
     /// STOP : mode basse consommation jusqu'à un appui sur un bouton (phase 5).
     stopped: bool,
 
@@ -70,6 +73,7 @@ pub const Cpu = struct {
             .ime = false,
             .ime_pending = false,
             .halted = false,
+            .halt_bug = false,
             .stopped = false,
         };
     }
@@ -115,15 +119,26 @@ pub const Cpu = struct {
 
     /// Exécute une instruction (ou prend en charge une interruption) et
     /// renvoie son nombre de M-cycles.
-    /// En HALT ou STOP, le CPU est à l'arrêt : 1 M-cycle sans rien lire.
+    /// En STOP, ou en HALT sans interruption en attente, le CPU est à
+    /// l'arrêt : 1 M-cycle sans rien exécuter.
     pub fn step(self: *Cpu, bus: anytype) Error!u8 {
-        if (self.halted or self.stopped) return 1;
+        if (self.stopped) return 1;
+        // HALT se réveille dès que IE & IF != 0, que IME vaille 0 ou 1.
+        // Avec IME = 1, l'interruption est prise juste après (+1 M-cycle
+        // pour sortir de HALT) ; avec IME = 0, on reprend simplement à
+        // l'instruction qui suit HALT, sans appeler de vecteur.
+        var wake_cycles: u8 = 0;
+        if (self.halted) {
+            if (pendingInterrupts(bus) == 0) return 1;
+            self.halted = false;
+            wake_cycles = 1;
+        }
         // Les interruptions sont testées AVANT d'appliquer le délai de EI :
         // juste après EI, IME vaut encore 0 ici, donc l'instruction qui suit
         // EI s'exécute toujours avant qu'une interruption puisse être prise.
         if (self.ime) {
-            const pending = bus.read(0xFFFF) & bus.read(0xFF0F) & 0x1F;
-            if (pending != 0) return self.serviceInterrupt(bus, pending);
+            const pending = pendingInterrupts(bus);
+            if (pending != 0) return wake_cycles + self.serviceInterrupt(bus, pending);
         }
         // Délai de EI : l'instruction qui suit EI s'exécute encore avec
         // l'ancien IME ; les interruptions ne seront vues qu'après elle.
@@ -153,9 +168,19 @@ pub const Cpu = struct {
         return 5;
     }
 
+    /// Interruptions demandées (IF) et autorisées (IE).
+    fn pendingInterrupts(bus: anytype) u8 {
+        return bus.read(0xFFFF) & bus.read(0xFF0F) & 0x1F;
+    }
+
     fn fetch(self: *Cpu, bus: anytype) u8 {
         const value = bus.read(self.pc);
-        self.pc +%= 1;
+        // HALT bug : PC n'avance pas une fois, l'octet sera relu.
+        if (self.halt_bug) {
+            self.halt_bug = false;
+        } else {
+            self.pc +%= 1;
+        }
         return value;
     }
 
@@ -474,9 +499,15 @@ pub const Cpu = struct {
             return 1;
         }
 
-        // HALT : le réveil (IE & IF != 0) et le « HALT bug » viendront en phase 3
+        // HALT : arrête le CPU jusqu'à ce que IE & IF != 0 (réveil dans step).
+        // « HALT bug » : avec IME = 0 et une interruption déjà en attente,
+        // le CPU ne s'arrête pas, et l'octet suivant est lu deux fois.
         if (op == 0x76) {
-            self.halted = true;
+            if (!self.ime and pendingInterrupts(bus) != 0) {
+                self.halt_bug = true;
+            } else {
+                self.halted = true;
+            }
             return 1;
         }
 
@@ -774,6 +805,61 @@ test "HALT (0x76, pas un LD) : le CPU s'arrête, PC ne bouge plus" {
     try expectEqual(@as(u8, 1), try cpu.step(&bus)); // rien n'est exécuté
     try expectEqual(@as(u16, 0xC001), cpu.pc);
     try expectEqual(@as(u8, 0x00), cpu.b);
+}
+
+test "HALT avec IME = 0 : réveil dès que IE & IF != 0, sans appeler le vecteur" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0x76, 0x04 }); // HALT ; INC B
+    cpu.b = 0x00;
+    bus.ie = 0x04;
+
+    _ = try cpu.step(&bus);
+    try expectEqual(true, cpu.halted);
+    try expectEqual(@as(u8, 1), try cpu.step(&bus)); // rien en attente
+    try expectEqual(true, cpu.halted);
+
+    bus.requestInterrupt(.timer);
+    try expectEqual(@as(u8, 1), try cpu.step(&bus)); // INC B, tout de suite
+    try expectEqual(false, cpu.halted);
+    try expectEqual(@as(u8, 0x01), cpu.b);
+    try expectEqual(@as(u16, 0xC002), cpu.pc);
+    try expectEqual(@as(u8, 0x04), bus.if_); // IF intact : pas de prise en charge
+}
+
+test "HALT avec IME = 1 : réveil puis prise de l'interruption (5 + 1 M-cycles)" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0x76, 0x04 });
+    cpu.ime = true;
+    cpu.sp = 0xDFFE;
+    bus.ie = 0x04;
+
+    _ = try cpu.step(&bus);
+    try expectEqual(true, cpu.halted);
+    bus.requestInterrupt(.timer);
+    try expectEqual(@as(u8, 6), try cpu.step(&bus));
+    try expectEqual(false, cpu.halted);
+    try expectEqual(@as(u16, 0x0050), cpu.pc);
+    // Adresse de retour : l'instruction qui suit HALT.
+    try expectEqual(@as(u8, 0xC0), bus.read(0xDFFD));
+    try expectEqual(@as(u8, 0x01), bus.read(0xDFFC));
+    try expectEqual(@as(u8, 0x00), bus.if_);
+}
+
+test "HALT bug : IME = 0 et interruption en attente, l'octet suivant est lu deux fois" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0x76, 0x04, 0x00 }); // HALT ; INC B ; NOP
+    cpu.b = 0x00;
+    bus.ie = 0x04;
+    bus.requestInterrupt(.timer);
+
+    _ = try cpu.step(&bus); // HALT : ne s'arrête pas
+    try expectEqual(false, cpu.halted);
+    try expectEqual(@as(u16, 0xC001), cpu.pc);
+    _ = try cpu.step(&bus); // INC B, mais PC n'avance pas
+    try expectEqual(@as(u16, 0xC001), cpu.pc);
+    _ = try cpu.step(&bus); // INC B à nouveau, normalement cette fois
+    try expectEqual(@as(u16, 0xC002), cpu.pc);
+    try expectEqual(@as(u8, 0x02), cpu.b);
 }
 
 test "LD (BC),A / LD A,(DE) : 2 M-cycles" {
