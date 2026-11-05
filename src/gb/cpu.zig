@@ -8,6 +8,7 @@
 //!   rp  : BC, DE, HL, SP  (LD rr,nn)
 //!   rp2 : BC, DE, HL, AF  (PUSH / POP)
 //! et q = y & 1 distingue deux instructions de la même colonne.
+//! Pour les sauts conditionnels, cc = y & 3 : NZ, Z, NC, C.
 //!
 //! `step` exécute une instruction et renvoie son nombre de M-cycles.
 
@@ -39,6 +40,8 @@ pub const Cpu = struct {
     l: u8,
     sp: u16,
     pc: u16,
+    /// Interrupt Master Enable : autorise les interruptions (RETI, EI, DI).
+    ime: bool,
 
     /// État post-boot d'une DMG (on saute la ROM de boot).
     pub fn init() Cpu {
@@ -53,6 +56,7 @@ pub const Cpu = struct {
             .l = 0x4D,
             .sp = 0xFFFE,
             .pc = 0x0100,
+            .ime = false,
         };
     }
 
@@ -252,7 +256,101 @@ pub const Cpu = struct {
             return 3;
         }
 
+        // JP nn
+        if (op == 0xC3) {
+            self.pc = self.fetch16(bus);
+            return 4;
+        }
+
+        // JP cc,nn : l'adresse est lue même si le saut n'est pas pris
+        if (x == 3 and z == 2 and y < 4) {
+            const addr = self.fetch16(bus);
+            if (!self.cond(@truncate(y))) return 3;
+            self.pc = addr;
+            return 4;
+        }
+
+        // JP HL : pas de lecture mémoire, 1 seul M-cycle
+        if (op == 0xE9) {
+            self.pc = self.hl();
+            return 1;
+        }
+
+        // JR e : déplacement signé depuis l'adresse qui suit l'instruction
+        if (op == 0x18) {
+            self.jr(self.fetch(bus));
+            return 3;
+        }
+
+        // JR cc,e
+        if (x == 0 and z == 0 and y >= 4) {
+            const e = self.fetch(bus);
+            if (!self.cond(@truncate(y))) return 2;
+            self.jr(e);
+            return 3;
+        }
+
+        // CALL nn : empile l'adresse de retour (celle qui suit le CALL)
+        if (op == 0xCD) {
+            const addr = self.fetch16(bus);
+            self.push(bus, self.pc);
+            self.pc = addr;
+            return 6;
+        }
+
+        // CALL cc,nn
+        if (x == 3 and z == 4 and y < 4) {
+            const addr = self.fetch16(bus);
+            if (!self.cond(@truncate(y))) return 3;
+            self.push(bus, self.pc);
+            self.pc = addr;
+            return 6;
+        }
+
+        // RET
+        if (op == 0xC9) {
+            self.pc = self.pop(bus);
+            return 4;
+        }
+
+        // RETI : RET + IME = 1 tout de suite (sans le délai de EI)
+        if (op == 0xD9) {
+            self.pc = self.pop(bus);
+            self.ime = true;
+            return 4;
+        }
+
+        // RET cc : un M-cycle de plus que RET quand il est pris (test de cc)
+        if (x == 3 and z == 0 and y < 4) {
+            if (!self.cond(@truncate(y))) return 2;
+            self.pc = self.pop(bus);
+            return 5;
+        }
+
+        // RST n : CALL vers l'adresse fixe y * 8 (0x00, 0x08, ..., 0x38)
+        if (x == 3 and z == 7) {
+            self.push(bus, self.pc);
+            self.pc = @as(u16, y) * 8;
+            return 4;
+        }
+
         return error.UnimplementedOpcode;
+    }
+
+    /// Condition des sauts : NZ, Z, NC, C.
+    fn cond(self: *const Cpu, comptime cc: u2) bool {
+        return switch (cc) {
+            0 => !self.f.z,
+            1 => self.f.z,
+            2 => !self.f.c,
+            3 => self.f.c,
+        };
+    }
+
+    /// PC += e, avec e signé (-128..127).
+    fn jr(self: *Cpu, e: u8) void {
+        const offset: i16 = @as(i8, @bitCast(e));
+        self.pc +%= @as(u16, @bitCast(offset));
     }
 
     /// SP + e (e signé) pour ADD SP,e et LD HL,SP+e.
@@ -738,4 +836,134 @@ test "LD HL,SP+e : 3 M-cycles, SP inchangé" {
     try expectEqual(@as(u16, 0xFFFD), cpu.hl());
     try expectEqual(@as(u16, 0xFFFF), cpu.sp);
     try expectEqual(@as(u8, 0x30), @as(u8, @bitCast(cpu.f))); // 0xFF + 0xFE : H C
+}
+
+test "JP nn : 4 M-cycles ; JP HL : 1 M-cycle" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0xC3, 0x00, 0xC1 });
+    bus.write(0xC100, 0xE9); // JP HL
+    cpu.setHl(0xC200);
+
+    try expectEqual(@as(u8, 4), try cpu.step(&bus));
+    try expectEqual(@as(u16, 0xC100), cpu.pc);
+    try expectEqual(@as(u8, 1), try cpu.step(&bus));
+    try expectEqual(@as(u16, 0xC200), cpu.pc);
+}
+
+test "JP cc,nn : 4 M-cycles si pris, 3 sinon" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{
+        0xC2, 0x00, 0xD0, // JP NZ (non pris : Z = 1)
+        0xCA, 0x00, 0xC1, // JP Z  (pris)
+    });
+    cpu.f = .{ .z = true };
+
+    try expectEqual(@as(u8, 3), try cpu.step(&bus));
+    try expectEqual(@as(u16, 0xC003), cpu.pc);
+    try expectEqual(@as(u8, 4), try cpu.step(&bus));
+    try expectEqual(@as(u16, 0xC100), cpu.pc);
+}
+
+test "JR e : déplacement signé depuis la fin de l'instruction" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0x18, 0x02, 0x00, 0x00, 0x18, 0xFA });
+
+    try expectEqual(@as(u8, 3), try cpu.step(&bus)); // +2 depuis 0xC002
+    try expectEqual(@as(u16, 0xC004), cpu.pc);
+    _ = try cpu.step(&bus); // -6 depuis 0xC006
+    try expectEqual(@as(u16, 0xC000), cpu.pc);
+}
+
+test "JR cc,e : 3 M-cycles si pris, 2 sinon" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0x38, 0x10, 0x30, 0x10 });
+    cpu.f = .{ .c = true };
+
+    try expectEqual(@as(u8, 3), try cpu.step(&bus)); // JR C : pris
+    try expectEqual(@as(u16, 0xC012), cpu.pc);
+    cpu.pc = 0xC002;
+    try expectEqual(@as(u8, 2), try cpu.step(&bus)); // JR NC : non pris
+    try expectEqual(@as(u16, 0xC004), cpu.pc);
+}
+
+test "CALL nn puis RET : 6 et 4 M-cycles" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0xCD, 0x00, 0xC1 });
+    bus.write(0xC100, 0xC9); // RET
+    cpu.sp = 0xD000;
+
+    try expectEqual(@as(u8, 6), try cpu.step(&bus));
+    try expectEqual(@as(u16, 0xC100), cpu.pc);
+    try expectEqual(@as(u16, 0xCFFE), cpu.sp);
+    // Adresse de retour 0xC003 : octet haut à SP+1.
+    try expectEqual(@as(u8, 0xC0), bus.read(0xCFFF));
+    try expectEqual(@as(u8, 0x03), bus.read(0xCFFE));
+
+    try expectEqual(@as(u8, 4), try cpu.step(&bus));
+    try expectEqual(@as(u16, 0xC003), cpu.pc);
+    try expectEqual(@as(u16, 0xD000), cpu.sp);
+}
+
+test "CALL cc,nn : 6 M-cycles si pris, 3 sinon et rien empilé" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{
+        0xC4, 0x00, 0xC1, // CALL NZ (non pris)
+        0xCC, 0x00, 0xC1, // CALL Z  (pris)
+    });
+    cpu.sp = 0xD000;
+    cpu.f = .{ .z = true };
+
+    try expectEqual(@as(u8, 3), try cpu.step(&bus));
+    try expectEqual(@as(u16, 0xC003), cpu.pc);
+    try expectEqual(@as(u16, 0xD000), cpu.sp);
+    try expectEqual(@as(u8, 6), try cpu.step(&bus));
+    try expectEqual(@as(u16, 0xC100), cpu.pc);
+    try expectEqual(@as(u16, 0xCFFE), cpu.sp);
+}
+
+test "RET cc : 5 M-cycles si pris, 2 sinon" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{0xD0}); // RET NC
+    bus.write(0xC100, 0xD8); // RET C
+    cpu.sp = 0xCFFE;
+    bus.write(0xCFFE, 0x00);
+    bus.write(0xCFFF, 0xC1);
+    cpu.f = .{ .c = true };
+
+    try expectEqual(@as(u8, 2), try cpu.step(&bus)); // RET NC : non pris
+    try expectEqual(@as(u16, 0xC001), cpu.pc);
+    try expectEqual(@as(u16, 0xCFFE), cpu.sp);
+
+    cpu.pc = 0xC100;
+    try expectEqual(@as(u8, 5), try cpu.step(&bus)); // RET C : pris
+    try expectEqual(@as(u16, 0xC100), cpu.pc);
+    try expectEqual(@as(u16, 0xD000), cpu.sp);
+}
+
+test "RETI : comme RET, et IME passe à 1" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{0xD9});
+    cpu.sp = 0xCFFE;
+    bus.write(0xCFFE, 0x00);
+    bus.write(0xCFFF, 0xC1);
+
+    try expectEqual(@as(u8, 4), try cpu.step(&bus));
+    try expectEqual(@as(u16, 0xC100), cpu.pc);
+    try expectEqual(@as(u16, 0xD000), cpu.sp);
+    try expectEqual(true, cpu.ime);
+}
+
+test "RST : 4 M-cycles, saut à y * 8, adresse de retour empilée" {
+    var buf: [32 * 1024]u8 = undefined;
+    var cpu, var bus = try setup(&buf, &.{ 0xFF, 0xC7 });
+    cpu.sp = 0xD000;
+
+    try expectEqual(@as(u8, 4), try cpu.step(&bus)); // RST 38h
+    try expectEqual(@as(u16, 0x0038), cpu.pc);
+    try expectEqual(@as(u8, 0xC0), bus.read(0xCFFF));
+    try expectEqual(@as(u8, 0x01), bus.read(0xCFFE));
+
+    cpu.pc = 0xC001;
+    _ = try cpu.step(&bus); // RST 00h
+    try expectEqual(@as(u16, 0x0000), cpu.pc);
 }
