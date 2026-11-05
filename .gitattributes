@@ -1,0 +1,4 @@
+# zig fmt exige des fins de ligne LF : on les impose quel que soit
+# core.autocrlf (sinon le runner Windows de la CI extrait en CRLF).
+*.zig text eol=lf
+*.zon text eol=lf
