@@ -14,6 +14,7 @@
 const std = @import("std");
 const cartridge = @import("cartridge.zig");
 const Cartridge = cartridge.Cartridge;
+const Timer = @import("timer.zig").Timer;
 
 /// Les 5 sources d'interruption, numérotées par leur bit dans IE et IF.
 /// Le numéro donne aussi la priorité (0 = la plus prioritaire)
@@ -26,7 +27,7 @@ pub const Interrupt = enum(u3) {
     joypad = 4,
 
     pub fn mask(self: Interrupt) u8 {
-        return @as(u8, 1) << @intFromEnum(self);
+        return @as(u8, 1) << @backingInt(self);
     }
 };
 
@@ -46,6 +47,8 @@ pub const Bus = struct {
     sc: u8 = 0,
     /// Tout ce que le jeu a envoyé sur le port série.
     serial: SerialOutput = .{},
+    /// DIV, TIMA, TMA, TAC (0xFF04..0xFF07).
+    timer: Timer = .{},
     /// Nombre d'accès (lectures et écritures) à des registres d'E/S
     /// pas encore implémentés.
     unimplemented_io_accesses: u64 = 0,
@@ -86,6 +89,12 @@ pub const Bus = struct {
         }
     }
 
+    /// Fait avancer les composants (pour l'instant le timer) de `m_cycles`
+    /// M-cycles. À appeler après chaque `Cpu.step`.
+    pub fn tick(self: *Bus, m_cycles: u8) void {
+        if (self.timer.tick(m_cycles)) self.requestInterrupt(.timer);
+    }
+
     /// Lève le drapeau d'une interruption dans IF. Appelée par le timer,
     /// le PPU, le joypad... Le CPU décidera de la servir selon IME et IE.
     pub fn requestInterrupt(self: *Bus, interrupt: Interrupt) void {
@@ -97,6 +106,7 @@ pub const Bus = struct {
             0xFF01 => self.sb,
             // Sur DMG, les bits 1 à 6 de SC n'existent pas et se lisent à 1.
             0xFF02 => self.sc | 0x7E,
+            0xFF04...0xFF07 => self.timer.read(addr),
             // Les bits 5 à 7 de IF n'existent pas et se lisent à 1.
             0xFF0F => self.if_ | 0xE0,
             else => blk: {
@@ -119,6 +129,7 @@ pub const Bus = struct {
                     self.sc &= 0x7F;
                 }
             },
+            0xFF04...0xFF07 => if (self.timer.write(addr, value)) self.requestInterrupt(.timer),
             0xFF0F => self.if_ = value & 0x1F,
             else => self.unimplemented_io_accesses += 1,
         }
@@ -237,4 +248,19 @@ test "requestInterrupt : lève le bon bit sans toucher aux autres" {
     // Demander deux fois la même ne change rien.
     bus.requestInterrupt(.timer);
     try std.testing.expectEqual(@as(u8, 0x15), bus.if_);
+}
+
+test "timer : débordement de TIMA via le bus -> IF bit 2" {
+    var buf: [32 * 1024]u8 = undefined;
+    var bus = try testBus(&buf);
+
+    bus.write(0xFF06, 0x10); // TMA
+    bus.write(0xFF05, 0xFF); // TIMA
+    bus.write(0xFF07, 0x05); // actif, bit 3 : +1 tous les 4 M-cycles
+    bus.tick(3);
+    try std.testing.expectEqual(@as(u8, 0), bus.if_);
+    bus.tick(1);
+    try std.testing.expectEqual(Interrupt.timer.mask(), bus.if_);
+    try std.testing.expectEqual(@as(u8, 0x10), bus.read(0xFF05));
+    try std.testing.expectEqual(@as(u64, 0), bus.unimplemented_io_accesses);
 }

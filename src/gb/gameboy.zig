@@ -15,6 +15,8 @@ pub const bus = @import("bus.zig");
 pub const Bus = bus.Bus;
 pub const cpu = @import("cpu.zig");
 pub const Cpu = cpu.Cpu;
+pub const timer = @import("timer.zig");
+pub const Timer = timer.Timer;
 
 /// Assemble les composants de la machine. Vide pour l'instant.
 pub const GameBoy = struct {

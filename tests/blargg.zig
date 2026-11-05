@@ -46,10 +46,13 @@ fn runBlargg(path: []const u8) !void {
     // Passed/Failed que lorsqu'un octet est arrivé.
     var seen_len: usize = 0;
     const outcome: Outcome = while (cycles < max_cycles) {
-        cycles += cpu.step(bus) catch |err| {
+        const m = cpu.step(bus) catch |err| {
             std.debug.print("PC={X:0>4} : {s}\n", .{ cpu.pc, @errorName(err) });
             break .cpu_error;
         };
+        // Le timer avance d'autant que l'instruction a duré.
+        bus.tick(m);
+        cycles += m;
         const len = bus.serial.len;
         if (len != seen_len) {
             seen_len = len;
