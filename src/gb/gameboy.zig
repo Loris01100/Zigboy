@@ -13,6 +13,8 @@ pub const cartridge = @import("cartridge.zig");
 pub const Cartridge = cartridge.Cartridge;
 pub const bus = @import("bus.zig");
 pub const Bus = bus.Bus;
+pub const cpu = @import("cpu.zig");
+pub const Cpu = cpu.Cpu;
 
 /// Assemble les composants de la machine. Vide pour l'instant.
 pub const GameBoy = struct {
