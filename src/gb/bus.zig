@@ -49,6 +49,11 @@ pub const Bus = struct {
     serial: SerialOutput = .{},
     /// DIV, TIMA, TMA, TAC (0xFF04..0xFF07).
     timer: Timer = .{},
+    /// Imite l'émulateur qui a produit les journaux de Gameboy Doctor
+    /// (tests/doctor.zig), au prix de deux écarts avec le vrai matériel :
+    /// LY (0xFF44) vaut toujours 0x90, et IF (0xFF0F) se lit sans
+    /// ses bits 5 à 7 à 1.
+    doctor_mode: bool = false,
     /// Nombre d'accès (lectures et écritures) à des registres d'E/S
     /// pas encore implémentés.
     unimplemented_io_accesses: u64 = 0,
@@ -108,12 +113,15 @@ pub const Bus = struct {
             0xFF02 => self.sc | 0x7E,
             0xFF04...0xFF07 => self.timer.read(addr),
             // Les bits 5 à 7 de IF n'existent pas et se lisent à 1.
-            0xFF0F => self.if_ | 0xE0,
-            else => blk: {
-                self.unimplemented_io_accesses += 1;
-                break :blk 0xFF;
-            },
+            0xFF0F => if (self.doctor_mode) self.if_ else self.if_ | 0xE0,
+            0xFF44 => if (self.doctor_mode) 0x90 else self.unimplementedRead(),
+            else => self.unimplementedRead(),
         };
+    }
+
+    fn unimplementedRead(self: *Bus) u8 {
+        self.unimplemented_io_accesses += 1;
+        return 0xFF;
     }
 
     fn writeIo(self: *Bus, addr: u16, value: u8) void {
@@ -263,4 +271,15 @@ test "timer : débordement de TIMA via le bus -> IF bit 2" {
     try std.testing.expectEqual(Interrupt.timer.mask(), bus.if_);
     try std.testing.expectEqual(@as(u8, 0x10), bus.read(0xFF05));
     try std.testing.expectEqual(@as(u64, 0), bus.unimplemented_io_accesses);
+}
+
+test "doctor_mode : LY = 0x90 et IF sans ses bits inutilisés" {
+    var buf: [32 * 1024]u8 = undefined;
+    var bus = try testBus(&buf);
+
+    try std.testing.expectEqual(@as(u8, 0xFF), bus.read(0xFF44));
+    bus.doctor_mode = true;
+    try std.testing.expectEqual(@as(u8, 0x90), bus.read(0xFF44));
+    bus.requestInterrupt(.timer);
+    try std.testing.expectEqual(@as(u8, 0x04), bus.read(0xFF0F));
 }

@@ -36,23 +36,21 @@ fn runBlargg(path: []const u8) !void {
     _ = try gb.cartridge.Header.parse(rom);
     if (rom.len > 32 * 1024) return error.MbcNotSupported;
 
-    const bus = try allocator.create(gb.Bus);
-    defer allocator.destroy(bus);
-    bus.* = gb.Bus.init(.{ .rom_only = .{ .rom = rom } });
-    var cpu = gb.Cpu.init();
+    const gameboy = try allocator.create(gb.GameBoy);
+    defer allocator.destroy(gameboy);
+    gameboy.* = gb.GameBoy.init(.{ .rom_only = .{ .rom = rom } });
+    const bus = &gameboy.bus;
 
     var cycles: u64 = 0;
     // Longueur du tampon série au dernier examen : on ne cherche
     // Passed/Failed que lorsqu'un octet est arrivé.
     var seen_len: usize = 0;
     const outcome: Outcome = while (cycles < max_cycles) {
-        const m = cpu.step(bus) catch |err| {
-            std.debug.print("PC={X:0>4} : {s}\n", .{ cpu.pc, @errorName(err) });
+        // Une instruction, puis le timer avance d'autant qu'elle a duré.
+        cycles += gameboy.step() catch |err| {
+            std.debug.print("PC={X:0>4} : {s}\n", .{ gameboy.cpu.pc, @errorName(err) });
             break .cpu_error;
         };
-        // Le timer avance d'autant que l'instruction a duré.
-        bus.tick(m);
-        cycles += m;
         const len = bus.serial.len;
         if (len != seen_len) {
             seen_len = len;
