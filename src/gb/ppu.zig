@@ -11,6 +11,9 @@
 //!
 //! L'interruption VBlank part à l'entrée de la ligne 144.
 //!
+//! Chaque ligne visible est dessinée d'un coup dans `framebuffer` au
+//! passage en mode 0 (`renderLine`), avec les registres du moment.
+//!
 //! L'interruption STAT (« LCD STAT », IF bit 1) a plusieurs sources,
 //! activées par les bits 3 à 6 de STAT : mode 0, mode 1, mode 2, LY = LYC.
 //! Le matériel en fait un seul fil, le OU des sources activées, et ne lève
@@ -62,6 +65,17 @@ const stat_irq_oam: u8 = 0x20;
 const stat_irq_lyc: u8 = 0x40;
 const stat_writable: u8 = 0x78;
 
+/// LCDC bit 0 (DMG) : fond et fenêtre affichés.
+const lcdc_bg_enable: u8 = 0x01;
+/// LCDC bit 3 : tilemap du fond en 0x9C00 (sinon 0x9800).
+const lcdc_bg_map: u8 = 0x08;
+/// LCDC bit 4 : tuiles en 0x8000, index non signé (sinon base 0x9000,
+/// index signé).
+const lcdc_tile_data: u8 = 0x10;
+
+pub const screen_width = 160;
+pub const screen_height = vblank_line;
+
 pub const vram_size = 0x2000;
 pub const oam_size = 0xA0;
 
@@ -70,6 +84,10 @@ pub const Ppu = struct {
     vram: [vram_size]u8 = @splat(0),
     /// OAM (0xFE00..0xFE9F), indexée depuis 0 : 40 sprites × 4 octets.
     oam: [oam_size]u8 = @splat(0),
+
+    /// L'image : une teinte par pixel (0 = blanc à 3 = noir), palette
+    /// déjà appliquée.
+    framebuffer: [screen_height][screen_width]u2 = @splat(@splat(0)),
 
     /// Position dans la ligne courante, de 0 à 455.
     dot: u16 = 0,
@@ -167,6 +185,7 @@ pub const Ppu = struct {
                 self.mode = .drawing;
             },
             drawing_end => if (visible) {
+                self.renderLine();
                 self.mode = .hblank;
             },
             dots_per_line => {
@@ -183,6 +202,53 @@ pub const Ppu = struct {
             },
             else => unreachable,
         }
+    }
+
+    /// Dessine la ligne LY dans le framebuffer.
+    pub fn renderLine(self: *Ppu) void {
+        const row = &self.framebuffer[self.ly];
+        // DMG : fond et fenêtre désactivés = couleur 0 partout (passée
+        // par BGP). Les sprites, eux, resteront dessinés par-dessus.
+        if (self.lcdc & lcdc_bg_enable == 0) {
+            @memset(row, applyPalette(self.bgp, 0));
+            return;
+        }
+        // Coordonnées dans la carte de fond 256 × 256 : les u8 reviennent
+        // à 0 après 255, comme sur le matériel.
+        const bg_y = self.ly +% self.scy;
+        for (row, 0..) |*pixel, x| {
+            const bg_x = @as(u8, @intCast(x)) +% self.scx;
+            pixel.* = applyPalette(self.bgp, self.bgColor(bg_x, bg_y));
+        }
+    }
+
+    /// Indice de couleur (0 à 3, avant palette) du pixel (x, y) de la
+    /// carte de fond.
+    fn bgColor(self: *const Ppu, x: u8, y: u8) u2 {
+        const map_base: u16 = if (self.lcdc & lcdc_bg_map != 0) 0x1C00 else 0x1800;
+        // La carte fait 32 × 32 tuiles de 8 × 8 pixels.
+        const tile_index = self.vram[map_base + @as(u16, y / 8) * 32 + x / 8];
+        return self.tilePixel(self.tileAddress(tile_index), x % 8, y % 8);
+    }
+
+    /// Adresse (dans la VRAM) des 16 octets d'une tuile, selon LCDC bit 4.
+    fn tileAddress(self: *const Ppu, index: u8) u16 {
+        if (self.lcdc & lcdc_tile_data != 0) return @as(u16, index) * 16;
+        // Base 0x9000, index de -128 à 127 : 0x8800..0x97FF.
+        const signed: i16 = @as(i8, @bitCast(index));
+        return @intCast(0x1000 + signed * 16);
+    }
+
+    /// Une tuile = 8 lignes de 2 octets. Le bit 7 de chaque octet est le
+    /// pixel de gauche ; le premier octet donne le bit 0 de la couleur,
+    /// le second le bit 1.
+    fn tilePixel(self: *const Ppu, tile_addr: u16, x: u8, y: u8) u2 {
+        const lo = self.vram[tile_addr + @as(u16, y) * 2];
+        const hi = self.vram[tile_addr + @as(u16, y) * 2 + 1];
+        const bit: u3 = @intCast(7 - x);
+        const b0: u2 = @intCast((lo >> bit) & 1);
+        const b1: u2 = @intCast((hi >> bit) & 1);
+        return b1 << 1 | b0;
     }
 
     pub fn read(self: *const Ppu, addr: u16) u8 {
@@ -243,6 +309,12 @@ pub const Ppu = struct {
         return irq;
     }
 };
+
+/// Une palette DMG = 4 teintes de 2 bits : bits 1-0 pour la couleur 0,
+/// bits 3-2 pour la couleur 1, etc.
+fn applyPalette(palette: u8, color: u2) u2 {
+    return @truncate(palette >> (@as(u3, color) * 2));
+}
 
 // --- Tests -----------------------------------------------------------------
 
@@ -473,4 +545,123 @@ test "rallumage : repart du dot 0 de la ligne 0" {
     try expectEqual(@as(u8, 0), ppu.ly);
     _ = ppu.tick(1);
     try expectEqual(@as(u8, 1), ppu.ly);
+}
+
+/// Tuile de test : chaque ligne vaut les couleurs 0, 1, 2, 3, 0, 1, 2, 3
+/// de gauche à droite (octet bas 0b0101_0101, octet haut 0b0011_0011).
+fn writeTestTile(ppu: *Ppu, tile_addr: u16) void {
+    for (0..8) |row| {
+        ppu.vram[tile_addr + row * 2] = 0x55;
+        ppu.vram[tile_addr + row * 2 + 1] = 0x33;
+    }
+}
+
+/// PPU avec le LCDC donné et la palette identité (couleur n = teinte n).
+fn testPpu(lcdc: u8) Ppu {
+    var ppu: Ppu = .{};
+    ppu.lcdc = lcdc;
+    ppu.bgp = 0xE4; // 3, 2, 1, 0
+    return ppu;
+}
+
+const expectEqualSlices = std.testing.expectEqualSlices;
+
+test "fond : tuile 1 en 0x8010, tilemap 0x9800" {
+    var ppu = testPpu(0x91);
+    writeTestTile(&ppu, 0x0010);
+    ppu.vram[0x1800] = 1; // tuile (0, 0) de la carte
+    ppu.renderLine();
+    try expectEqualSlices(u2, &.{ 0, 1, 2, 3, 0, 1, 2, 3 }, ppu.framebuffer[0][0..8]);
+    // La tuile voisine (index 0, vide) : couleur 0.
+    try expectEqual(@as(u2, 0), ppu.framebuffer[0][11]);
+}
+
+test "fond : BGP est appliquée" {
+    var ppu = testPpu(0x91);
+    ppu.bgp = 0x1B; // inversée : couleur n -> teinte 3 - n
+    writeTestTile(&ppu, 0x0010);
+    ppu.vram[0x1800] = 1;
+    ppu.renderLine();
+    try expectEqualSlices(u2, &.{ 3, 2, 1, 0, 3, 2, 1, 0 }, ppu.framebuffer[0][0..8]);
+}
+
+test "fond : la ligne est dessinée au passage en mode 0" {
+    var ppu = testPpu(0x91);
+    writeTestTile(&ppu, 0x0010);
+    @memset(ppu.vram[0x1800..0x1C00], 1); // toute la carte
+    gotoLine(&ppu, 5);
+    _ = ppu.tick(drawing_end - 1);
+    try expectEqual(@as(u2, 0), ppu.framebuffer[5][3]);
+    _ = ppu.tick(1);
+    try expectEqual(Mode.hblank, ppu.mode);
+    try expectEqual(@as(u2, 3), ppu.framebuffer[5][3]);
+    try expectEqual(@as(u2, 3), ppu.framebuffer[5][159]);
+    try expectEqual(@as(u2, 0), ppu.framebuffer[6][3]);
+}
+
+test "fond : SCX décale vers la gauche, SCY vers le haut" {
+    var ppu = testPpu(0x91);
+    // Tuile (1, 1) de la carte : pixels 8 à 15 en x et en y.
+    writeTestTile(&ppu, 0x0010);
+    ppu.vram[0x1800 + 32 + 1] = 1;
+    ppu.scx = 10;
+    ppu.scy = 3;
+    ppu.ly = 5; // ligne 8 de la carte
+    ppu.renderLine();
+    // Écran x = 0 -> carte x = 10 : 3e pixel de la tuile.
+    try expectEqualSlices(u2, &.{ 2, 3, 0, 1, 2, 3 }, ppu.framebuffer[5][0..6]);
+    try expectEqual(@as(u2, 0), ppu.framebuffer[5][6]); // carte x = 16
+    ppu.ly = 4; // ligne 7 de la carte : au-dessus de la tuile
+    ppu.renderLine();
+    try expectEqual(@as(u2, 0), ppu.framebuffer[4][1]);
+}
+
+test "fond : le défilement revient à 0 après 255" {
+    var ppu = testPpu(0x91);
+    writeTestTile(&ppu, 0x0010);
+    ppu.vram[0x1800] = 1; // tuile (0, 0)
+    ppu.scx = 252;
+    ppu.scy = 250;
+    ppu.ly = 6; // 250 + 6 = 256 -> ligne 0 de la carte
+    ppu.renderLine();
+    // Écran x = 4 -> carte x = 256 -> 0.
+    try expectEqualSlices(u2, &.{ 0, 1, 2, 3, 0, 1, 2, 3 }, ppu.framebuffer[6][4..12]);
+    try expectEqual(@as(u2, 0), ppu.framebuffer[6][3]); // carte x = 255
+}
+
+test "fond : LCDC bit 3 choisit la tilemap 0x9C00" {
+    var ppu = testPpu(0x99);
+    writeTestTile(&ppu, 0x0010);
+    ppu.vram[0x1C00] = 1;
+    ppu.renderLine();
+    try expectEqual(@as(u2, 3), ppu.framebuffer[0][3]);
+    ppu.lcdc = 0x91;
+    ppu.renderLine();
+    try expectEqual(@as(u2, 0), ppu.framebuffer[0][3]);
+}
+
+test "fond : LCDC bit 4 = 0, index signé autour de 0x9000" {
+    var ppu = testPpu(0x81);
+    writeTestTile(&ppu, 0x1000); // index 0 -> 0x9000
+    writeTestTile(&ppu, 0x0FF0); // index 0xFF (-1) -> 0x8FF0
+    writeTestTile(&ppu, 0x0800); // index 0x80 (-128) -> 0x8800
+    writeTestTile(&ppu, 0x0010); // 0x8010 : ne doit pas être lue
+    ppu.vram[0x1800] = 0;
+    ppu.vram[0x1801] = 0xFF;
+    ppu.vram[0x1802] = 1; // -> 0x9010, vide
+    ppu.vram[0x1803] = 0x80;
+    ppu.renderLine();
+    try expectEqual(@as(u2, 3), ppu.framebuffer[0][3]);
+    try expectEqual(@as(u2, 3), ppu.framebuffer[0][11]);
+    try expectEqual(@as(u2, 0), ppu.framebuffer[0][19]);
+    try expectEqual(@as(u2, 3), ppu.framebuffer[0][27]);
+}
+
+test "fond : LCDC bit 0 = 0, couleur 0 partout" {
+    var ppu = testPpu(0x90);
+    ppu.bgp = 0x1B; // couleur 0 -> teinte 3
+    writeTestTile(&ppu, 0x0010);
+    @memset(ppu.vram[0x1800..0x1C00], 1);
+    ppu.renderLine();
+    for (ppu.framebuffer[0]) |pixel| try expectEqual(@as(u2, 3), pixel);
 }
